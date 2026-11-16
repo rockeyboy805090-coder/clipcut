@@ -1,20 +1,32 @@
-"""Phase 2: viral clip finding — real implementation.
+"""Phase 3: viral clip finding with DUAL-JUDGE scoring — real implementation.
 
-Free stack only. Scoring is rule-based by default; Gemini FREE API is
-used ONLY if GEMINI_API_KEY is set in .env and google-generativeai is
-installed. If there is no key, or the API fails, scoring falls back to
-the rule-based scorer and the output honestly records
-scoring_method="rule_based" — Gemini is NEVER claimed when it was not used.
+Free stack only. Two separate judges must AGREE before a clip is kept
+(CreativeCut rule, teardown §1.5):
+  * Words judge    — reads ONLY what was said (transcript text).
+    Gemini FREE API when GEMINI_API_KEY is set (and the library is
+    installed); otherwise the rule-based scorer below. Without a key
+    the output honestly records scoring_method="rule_based" — Gemini
+    is NEVER claimed when it was not used.
+  * Reaction judge — sees ONLY loudness (+ chat activity when the
+    caller passes it in). Lives in dual_judge.py; one ffmpeg astats
+    pass, no torch, no extra model.
+Combine (defaults, tunable via Options): keep a candidate ONLY when
+words_score >= 50 AND reaction_score >= 40. Combined score =
+round(0.6 * words + 0.4 * reaction); the old single `score` field IS
+the combined score, so render/UI code keeps working.
 
 Pipeline:
-  transcript (words + segments) -> candidate 30-60s windows (sliding,
-  sentence/segment boundaries, min 25s / max 65s) -> score 0-100 each:
+  transcript (words + segments) -> long segments split into
+  sentence-level pieces (Phase 3: coarse Whisper segments yielded
+  too few candidates on short videos) -> candidate windows
+  (min_sec-max_sec, default 15-60s) -> words score 0-100 each:
     Hook strength, first 5 sec (question/shock/secret/mistake/money/
     number/guest name) = 30
     Emotion / curiosity = 30
     Complete idea in 60s = 20
     Loop potential (end connects to start / ends on a tease) = 20
-  -> dedupe overlapping windows -> TOP 5-8 clips, sorted by score.
+  -> reaction score 0-100 each (loudness + chat)
+  -> BOTH-judges gate -> dedupe overlapping windows -> TOP clips.
 
 Output is saved to outputs/clips/<upload_id>_clips.json.
 Words are never invented — hook_line and transcript_text come straight
@@ -233,6 +245,95 @@ def _score_loop(text: str, language: str = "en") -> int:
     return min(20, score)
 
 
+_SENT_END_RE = re.compile(r"[.!?\u0964\u06d4]+$")
+_MAX_SENTENCE_SEC = 25.0  # run-on sentence safety: split long sentences
+
+
+def _split_segments_into_sentences(transcript: dict) -> list[dict]:
+    """Split long Whisper segments into sentence-level pieces.
+
+    Phase 3 fix for the Phase 2 "count vs content" note: Whisper
+    merged a 64.5s speech into just 3 segments, so the finder built
+    only 2 candidates and dedupe left 1 clip for a count=2 request.
+    Sentence pieces give the windower many more start boundaries,
+    so short videos yield more candidates. Uses word timestamps
+    (real when Whisper gave them, segment-derived otherwise), so
+    sub-segment times are honest. A piece ends at a sentence
+    terminator (. ? ! । ؟) or at an original segment end; run-on
+    sentences are cut at ~25s (preferring a comma).
+    Returns [{"start", "end", "text"}].
+    """
+    words = sorted(transcript.get("words") or [],
+                   key=lambda w: float(w.get("start", 0)))
+    segments = transcript.get("segments") or []
+    if not segments:
+        return []
+    if not words:
+        # No word timings: split each segment's text on sentences,
+        # spreading time proportionally by character count.
+        out: list[dict] = []
+        for seg in segments:
+            text = str(seg.get("text") or "").strip()
+            start, end = float(seg.get("start", 0)), float(seg.get("end", 0))
+            if not text or end <= start:
+                out.append({"start": start, "end": end, "text": text})
+                continue
+            parts = [p.strip() for p in re.split(r"(?<=[.!?\u0964\u06d4])\s+", text) if p.strip()]
+            if len(parts) <= 1:
+                out.append({"start": start, "end": end, "text": text})
+                continue
+            total = sum(len(p) for p in parts)
+            cur = start
+            for p in parts:
+                span = (end - start) * (len(p) / total) if total else 0
+                out.append({"start": round(cur, 2), "end": round(cur + span, 2),
+                            "text": p})
+                cur += span
+        return out
+    out: list[dict] = []
+    for seg in segments:
+        ss, se = float(seg.get("start", 0)), float(seg.get("end", 0))
+        seg_words = [w for w in words
+                     if float(w.get("start", 0)) >= ss - 0.05
+                     and float(w.get("start", 0)) < se]
+        if not seg_words:
+            # Segment with no timed words: keep it whole.
+            text = str(seg.get("text") or "").strip()
+            if text:
+                out.append({"start": ss, "end": se, "text": text})
+            continue
+        cur: list[dict] = []
+        last_comma_idx: int | None = None
+
+        def flush(piece: list[dict]) -> None:
+            if not piece:
+                return
+            out.append({"start": round(float(piece[0]["start"]), 2),
+                        "end": round(float(piece[-1]["end"]), 2),
+                        "text": " ".join(str(w["word"]) for w in piece)})
+
+        for w in seg_words:
+            cur.append(w)
+            if str(w.get("word", "")).rstrip().endswith(","):
+                last_comma_idx = len(cur) - 1
+            span = float(w["end"]) - float(cur[0]["start"])
+            if _SENT_END_RE.search(str(w.get("word", "")).strip()):
+                flush(cur)
+                cur, last_comma_idx = [], None
+            elif span > _MAX_SENTENCE_SEC:
+                # Run-on: cut at the last comma if there is one,
+                # otherwise right here.
+                if last_comma_idx is not None and last_comma_idx > 0:
+                    flush(cur[:last_comma_idx + 1])
+                    cur = cur[last_comma_idx + 1:]
+                else:
+                    flush(cur)
+                    cur = []
+                last_comma_idx = None
+        flush(cur)
+    return out
+
+
 def score_candidate(text: str, first_text: str, duration: float,
                     language: str = "en", min_sec: float = 25.0,
                     max_sec: float = 65.0) -> tuple[int, dict]:
@@ -248,7 +349,8 @@ def score_candidate(text: str, first_text: str, duration: float,
 def build_candidates(transcript: dict, language: str = "en",
                      min_sec: float = 25.0, max_sec: float = 65.0,
                      from_sec: float | None = None,
-                     to_sec: float | None = None) -> list[dict]:
+                     to_sec: float | None = None,
+                     split_sentences: bool = True) -> list[dict]:
     """Sliding windows over transcript segments: min_sec-max_sec each.
 
     Windows start at every segment boundary and extend until they
@@ -290,6 +392,15 @@ def build_candidates(transcript: dict, language: str = "en",
         if cur:
             segments.append({"start": cur[0]["start"], "end": cur[-1]["end"],
                              "text": " ".join(x["word"] for x in cur)})
+    if not segments:
+        return []
+    # Phase 3: split long segments into sentence pieces BEFORE
+    # windowing — many more start boundaries, more candidates on
+    # short videos. split_sentences=False keeps the old behaviour
+    # (used by the Phase 3 before/after test only).
+    if split_sentences:
+        segments = _split_segments_into_sentences(
+            {"words": words, "segments": segments})
     if not segments:
         return []
 
@@ -437,12 +548,17 @@ def _gemini_api_key() -> str:
     return ""
 
 
-def _gemini_rescore(candidates: list[dict],
-                    video_type: str = "auto") -> list[dict] | None:
-    """Ask Gemini FREE API to re-score/rank candidates.
+def _gemini_words_judge(candidates: list[dict], video_type: str = "auto",
+                        language: str = "en") -> dict | None:
+    """The WORDS judge (Phase 3): Gemini reads ONLY what was said.
 
-    Returns the rescored candidate list, or None on any failure
-    (no key, no library, API error) — caller falls back to rule-based.
+    Scores each candidate 0-100 on the transcript text alone — hook
+    in the first 5 sec = 30, emotion/curiosity = 30, complete idea
+    = 20, loop potential = 20. It is NEVER shown loudness, chat or
+    any other signal (that is the Reaction judge's job, dual_judge.py).
+    Returns {index: {"words_score", "words_reason", "hook_line"}} or
+    None on any failure (no key, no library, API error) — the caller
+    then uses the rule-based words score instead.
     Phase 2: the video type (when not auto-detect) is passed in the
     prompt so the model prefers moments that fit that type.
     """
@@ -464,9 +580,12 @@ def _gemini_rescore(candidates: list[dict],
             type_line = (f"Video type: {video_type}. Prefer moments that "
                          f"fit a {video_type} video. ")
         prompt = (
-            "You rank short video clips for Instagram Reels virality. "
-            "Score each candidate 0-100 (hook in first 5 sec = 30, emotion/curiosity = 30, "
-            "complete idea = 20, loop potential = 20). " + type_line +
+            "You are the WORDS judge for short video clips. Read ONLY "
+            "what was said in each candidate's transcript text — you "
+            "cannot hear the audio and you get no loudness or chat data. "
+            "Score each candidate 0-100 (hook in first 5 sec = 30, "
+            "emotion/curiosity = 30, complete idea = 20, loop "
+            "potential = 20). " + type_line +
             "Reply ONLY as a JSON array, "
             "no other text, no markdown fences, each item: "
             '{"id": <index>, "score": <0-100>, "reason": "<short, in Hinglish>", '
@@ -477,19 +596,45 @@ def _gemini_rescore(candidates: list[dict],
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
-        by_id = {int(d["id"]): d for d in data if isinstance(d, dict) and "id" in d}
-        out = []
-        for i, cand in enumerate(candidates):
-            if i in by_id:
-                d = by_id[i]
-                cand = dict(cand)
-                cand["score"] = max(0, min(100, int(d.get("score", cand["score"]))))
-                cand["gemini_reason"] = str(d.get("reason", ""))[:200]
-                cand["gemini_hook"] = str(d.get("hook_line", ""))[:160]
-            out.append(cand)
-        return out
+        out: dict = {}
+        for d in data:
+            if not isinstance(d, dict) or "id" not in d:
+                continue
+            try:
+                idx = int(d["id"])
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(candidates):
+                out[idx] = {
+                    "words_score": max(0, min(100, int(d.get("score", 0)))),
+                    "words_reason": str(d.get("reason", ""))[:200],
+                    "hook_line": str(d.get("hook_line", ""))[:160],
+                }
+        return out if out else None
     except Exception:
         return None
+
+
+def _gemini_rescore(candidates: list[dict],
+                    video_type: str = "auto") -> list[dict] | None:
+    """Backwards-compatible wrapper (Phase 2 name).
+
+    Applies the Gemini words judge and writes its scores onto the
+    candidate dicts (old behaviour). New code should call
+    _gemini_words_judge directly.
+    """
+    judged = _gemini_words_judge(candidates, video_type=video_type)
+    if judged is None:
+        return None
+    out = []
+    for i, cand in enumerate(candidates):
+        if i in judged:
+            cand = dict(cand)
+            cand["score"] = judged[i]["words_score"]
+            cand["gemini_reason"] = judged[i]["words_reason"]
+            cand["gemini_hook"] = judged[i]["hook_line"]
+        out.append(cand)
+    return out
 
 
 def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
@@ -497,14 +642,15 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
                language: str | None = None, min_sec: float | None = None,
                max_sec: float | None = None, from_sec: float | None = None,
                to_sec: float | None = None, video_type: str = "auto",
-               options: dict | None = None) -> dict:
-    """Find top viral clips from a transcript dict.
+               options: dict | None = None, video_path=None,
+               chat_activity=None) -> dict:
+    """Find top viral clips from a transcript dict — DUAL-JUDGE (Phase 3).
 
     Returns {"upload_id", "scoring_method", "scoring_language",
-    "style_name", "clips": [...]}
+    "style_name", "clips": [...], "judges": {...}, "dropped": [...]}
     and saves outputs/clips/<upload_id>_clips.json.
-    scoring_method is "gemini" only when Gemini actually rescored,
-    otherwise "rule_based".
+    scoring_method is "gemini" only when the Gemini WORDS judge
+    actually scored, otherwise "rule_based".
     Language: "en" by DEFAULT (English keyword banks are primary).
     Falls back to the transcript's language_requested, then "en".
 
@@ -513,7 +659,16 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
     The resolved options are recorded in the output ("options") and on
     every clip ("video_type"), so a later render knows what was
     chosen. Defaults preserve the old behaviour (windows 25-65s).
+
+    Phase 3: `video_path` enables the Reaction judge (loudness curve
+    from the actual file). Without it the reaction score is a neutral
+    50 and the reason says so. `chat_activity` is an optional list of
+    {"time", "count"} / {"start", "end", "count"} buckets — no chat
+    is fetched here (Phase 7). Thresholds come from options
+    (words_threshold 50, reaction_threshold 40 by default).
     """
+    from dual_judge import extract_loudness_curve, reaction_judge
+
     if options:
         min_sec = options.get("min_sec", min_sec)
         max_sec = options.get("max_sec", max_sec)
@@ -525,29 +680,122 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
     max_sec = float(max_sec) if max_sec is not None else MAX_CLIP_SEC
     video_type = (video_type or "auto").strip().lower()
     top_n = max(1, min(8, int(top_n or 5)))
+    words_threshold = int((options or {}).get("words_threshold", 50))
+    reaction_threshold = int((options or {}).get("reaction_threshold", 40))
     lang = (language or transcript.get("language_requested") or "en").lower()
     if lang not in ("en", "hinglish", "hi"):
         lang = "en"
     candidates = build_candidates(transcript, lang, min_sec=min_sec,
                                   max_sec=max_sec, from_sec=from_sec,
                                   to_sec=to_sec)
-    scoring_method = "rule_based"
+    # Segment counts for the Phase 3 report (before/after split).
+    segments_count = len(transcript.get("segments") or [])
+    try:
+        split_segments_count = len(
+            _split_segments_into_sentences(transcript))
+    except Exception:
+        split_segments_count = segments_count
+
+    # --- WORDS judge: Gemini when a key is set, else rule-based. ---
+    words_judge = "rule_based"
+    judged = None
     if use_gemini and candidates:
-        rescored = _gemini_rescore(candidates, video_type=video_type)
-        if rescored is not None:
-            candidates = rescored
-            scoring_method = "gemini"
-    picked = _dedupe_rank(candidates, top_n)
+        judged = _gemini_words_judge(candidates, video_type=video_type,
+                                     language=lang)
+        if judged is not None:
+            words_judge = "gemini"
+    scoring_method = words_judge
+    for i, cand in enumerate(candidates):
+        rule_score = int(cand["score"])
+        cand["rule_score"] = rule_score
+        if judged is not None and i in judged:
+            cand["words_score"] = int(judged[i]["words_score"])
+            cand["words_reason"] = judged[i]["words_reason"]
+            cand["gemini_hook"] = judged[i]["hook_line"]
+        else:
+            cand["words_score"] = rule_score
+            cand["words_reason"] = _reason(cand["breakdown"], rule_score, lang)
+
+    # --- REACTION judge: loudness (+ chat when supplied). ---
+    curve = None
+    reaction_note = None
+    if video_path is not None:
+        try:
+            curve = extract_loudness_curve(video_path)
+        except Exception as exc:
+            reaction_note = f"loudness measure nahi ho saka: {exc}"
+    video_duration = None
+    if curve is not None:
+        video_duration = curve.get("duration")
+    elif transcript.get("words"):
+        try:
+            video_duration = float(transcript["words"][-1]["end"])
+        except Exception:
+            video_duration = None
+    chat_supplied = bool(chat_activity)
+    for cand in candidates:
+        rj = reaction_judge(cand["start"], cand["end"], curve,
+                            chat_activity=chat_activity,
+                            video_duration=video_duration)
+        cand["reaction_score"] = int(rj["score"])
+        cand["reaction_reason"] = rj["reason"]
+        cand["reaction_breakdown"] = rj["breakdown"]
+        if reaction_note and curve is None:
+            cand["reaction_reason"] = (
+                f"Reaction {rj['score']}/100 — {reaction_note}; "
+                f"neutral score diya gaya hai")
+    if curve is None:
+        reaction_judge_name = "neutral (no audio)"
+    elif chat_supplied:
+        reaction_judge_name = "loudness+chat"
+    else:
+        reaction_judge_name = "loudness"
+
+    # --- COMBINE (CreativeCut rule): BOTH judges must agree. ---
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for cand in candidates:
+        ws, rs = int(cand["words_score"]), int(cand["reaction_score"])
+        cand["combined_score"] = int(round(0.6 * ws + 0.4 * rs))
+        cand["score"] = cand["combined_score"]  # old field = combined
+        cand["judges_agree"] = ws >= words_threshold and rs >= reaction_threshold
+        if cand["judges_agree"]:
+            kept.append(cand)
+        else:
+            why = []
+            if ws < words_threshold:
+                why.append(f"words judge fail ({ws} < {words_threshold})")
+            if rs < reaction_threshold:
+                why.append(f"reaction judge fail ({rs} < {reaction_threshold})")
+            dropped.append({
+                "start": cand["start"], "end": cand["end"],
+                "duration": cand["duration"],
+                "words_score": ws, "reaction_score": rs,
+                "combined_score": cand["combined_score"],
+                "reason": "; ".join(why),
+            })
+    picked = _dedupe_rank(kept, top_n)
     clips = []
     for idx, cand in enumerate(picked, start=1):
         hook = cand.get("gemini_hook") or _hook_line(cand["text"])
-        reason = cand.get("gemini_reason") or _reason(cand["breakdown"], cand["score"], lang)
         clips.append({
             "clip_id": f"clip_{idx:02d}",
             "start": cand["start"], "end": cand["end"],
             "duration": cand["duration"],
             "score": int(cand["score"]),
-            "reason": reason,
+            "combined_score": int(cand["combined_score"]),
+            "words_score": int(cand["words_score"]),
+            "words_reason": cand["words_reason"],
+            "words_judge": words_judge,
+            "reaction_score": int(cand["reaction_score"]),
+            "reaction_reason": cand["reaction_reason"],
+            "reaction_breakdown": cand.get("reaction_breakdown"),
+            "judges_agree": True,
+            "reason": (
+                f"Words {cand['words_score']}/100; "
+                f"Reaction {cand['reaction_score']}/100; "
+                f"Combined {cand['combined_score']}/100 — "
+                f"{cand['words_reason']}"),
             "hook_line": hook,
             "transcript_text": cand["text"],
             "scoring_method": scoring_method,
@@ -570,8 +818,25 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
             "caption_style": (options or {}).get("caption_style", "bounce"),
             "layout": (options or {}).get("layout", "blurred_fill"),
             "quality": (options or {}).get("quality", "720p"),
+            "words_threshold": words_threshold,
+            "reaction_threshold": reaction_threshold,
         },
+        "judges": {
+            "words_judge": words_judge,
+            "reaction_judge": reaction_judge_name,
+            "words_threshold": words_threshold,
+            "reaction_threshold": reaction_threshold,
+            "combine": ("clip tabhi jab dono judge agree karein "
+                        f"(words >= {words_threshold} AND reaction >= "
+                        f"{reaction_threshold}); combined = "
+                        "round(0.6*words + 0.4*reaction)"),
+            "reaction_note": reaction_note,
+        },
+        "segments_count": segments_count,
+        "split_segments_count": split_segments_count,
         "candidates_count": len(candidates),
+        "candidates_after_gate": len(kept),
+        "dropped": dropped,
         "clips": clips,
     }
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -602,6 +867,21 @@ def load_clips(upload_id: str) -> dict:
             changed = True
         if "scoring_method" not in clip:
             clip["scoring_method"] = data.get("scoring_method", "rule_based")
+            changed = True
+        # Phase 3 backfill: clips written before dual-judge have no
+        # judge fields — fill from the old single score, honestly
+        # marked (reaction unknown, not invented).
+        if "words_score" not in clip:
+            clip["words_score"] = clip.get("score")
+            clip["words_reason"] = clip.get("reason", "")
+            clip["words_judge"] = clip.get("scoring_method", "rule_based")
+            clip["reaction_score"] = None
+            clip["reaction_reason"] = (
+                "Reaction judge Phase 3 se pehle ki clip hai — "
+                "loudness score recorded nahi hai")
+            clip["reaction_breakdown"] = None
+            clip["combined_score"] = clip.get("score")
+            clip["judges_agree"] = None
             changed = True
     if changed:
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")

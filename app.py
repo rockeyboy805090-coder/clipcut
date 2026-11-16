@@ -93,7 +93,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ClipCut", version="0.8.0-phase2", lifespan=lifespan)
+app = FastAPI(title="ClipCut", version="0.9.0-phase3", lifespan=lifespan)
 
 
 def init_db() -> None:
@@ -134,7 +134,7 @@ def health() -> JSONResponse:
     # --version + one --list-impersonate-targets at first call) —
     # cheap, and they prove on the LIVE instance whether node and
     # browser impersonation are actually available there.
-    return JSONResponse({"status": "ok", "phase": 2, "app": "clipcut-phase2",
+    return JSONResponse({"status": "ok", "phase": 3, "app": "clipcut-phase3",
                          "ffmpeg": ffmpeg_status(),
                          "youtube": youtube_runtime_diagnostics(),
                          "auth": {"google_configured": google_oauth_configured()}})
@@ -369,6 +369,9 @@ async def find_clips_endpoint(
     layout: str | None = Form(default=None),
     quality: str | None = Form(default=None),
     video_type: str | None = Form(default=None),
+    # Phase 3 dual-judge thresholds (defaults 50/40 — see options.py).
+    words_threshold: str | None = Form(default=None),
+    reaction_threshold: str | None = Form(default=None),
 ) -> dict:
     """Find top viral clips for an upload.
 
@@ -397,6 +400,8 @@ async def find_clips_endpoint(
             "from_min": from_min, "to_min": to_min,
             "caption_style": caption_style, "layout": layout,
             "quality": quality, "video_type": video_type,
+            "words_threshold": words_threshold,
+            "reaction_threshold": reaction_threshold,
         }, video_duration=duration)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -416,9 +421,12 @@ async def find_clips_endpoint(
         raise HTTPException(
             status_code=400,
             detail="Transcript khaali hai — video me boli hui baat nahi mili, clips nahi ban sakte")
+    # Phase 3: pass the real video file so the Reaction judge can
+    # measure loudness (without it the reaction score is neutral 50).
     result = find_clips(transcript, upload_id, top_n=opts["clip_count"],
                         style_name=style_name, options=opts,
-                        language=language or transcript.get("language_requested") or "en")
+                        language=language or transcript.get("language_requested") or "en",
+                        video_path=video_path)
     return {"message": "Clips ready.", "options": options_summary(opts), **result}
 
 

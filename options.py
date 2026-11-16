@@ -93,6 +93,10 @@ DEFAULT_OPTIONS = {
     "video_type": "auto",
     "from_sec": None,
     "to_sec": None,
+    # Phase 3 dual-judge thresholds (CreativeCut rule: clip tabhi jab
+    # DONO judge agree karein). Tunable via Options; defaults 50/40.
+    "words_threshold": 50,
+    "reaction_threshold": 40,
 }
 
 # Hard limits from the task spec (validation, not defaults).
@@ -167,6 +171,20 @@ def parse_options(raw: dict | None, video_duration: float | None = None) -> dict
     if opts["min_sec"] >= opts["max_sec"]:
         raise ValueError(
             f"Shortest ({opts['min_sec']}s) Longest ({opts['max_sec']}s) se chhota hona chahiye")
+
+    # --- Phase 3 dual-judge thresholds: 0-100 each ---
+    v = pick("words_threshold")
+    if v is not None:
+        n = _as_int(v, "Words threshold")
+        if not 0 <= n <= 100:
+            raise ValueError(f"Words threshold 0-100 ke beech hona chahiye — mila: {n}")
+        opts["words_threshold"] = n
+    v = pick("reaction_threshold")
+    if v is not None:
+        n = _as_int(v, "Reaction threshold")
+        if not 0 <= n <= 100:
+            raise ValueError(f"Reaction threshold 0-100 ke beech hona chahiye — mila: {n}")
+        opts["reaction_threshold"] = n
 
     # --- enums: invalid values are errors, never silent defaults ---
     v = pick("caption_style")
@@ -305,4 +323,6 @@ def options_summary(opts: dict) -> dict:
         "video_type": o.get("video_type", "auto"),
         "from_sec": o.get("from_sec"),
         "to_sec": o.get("to_sec"),
+        "words_threshold": o.get("words_threshold", 50),
+        "reaction_threshold": o.get("reaction_threshold", 40),
     }

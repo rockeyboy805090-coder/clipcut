@@ -108,16 +108,50 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
   `_register_download` inserted 6 values into the 8-column uploads
   table, so every YouTube job died at registration. It now inserts
   all 8 and tags user_id/creator_id.
-- Still NOT done: Phase 3 dual-judge scoring (words + loudness/chat),
-  Phase 5 clip editor, Phase 6 BYOK ledger, Phase 7 live recorder,
-  Phase 8 posting queue, Phase 10 deploy.
+## Phase 3 (16 Nov 2026) — Dual-judge scoring (TEST-PASS, local real runs)
 
-## Not done yet (Phases 3–10, see CLONE_PLAN.md §4)
+Two judges must AGREE before a clip is kept (CreativeCut rule):
+- **Words judge** (`clip_finder._gemini_words_judge`): Gemini reads ONLY
+  the transcript text when `GEMINI_API_KEY` is set; otherwise the
+  rule-based scorer is the words judge and the output says
+  `scoring_method: rule_based` (no key is set in this repo).
+- **Reaction judge** (`dual_judge.py`, NEW): loudness from one ffmpeg
+  `astats` pass (per-second RMS/Peak bins; no torch, no extra model)
+  + chat activity ONLY when the caller passes it in — no chat is
+  fetched here (Phase 7). No chat data = loudness-only, and the
+  reason says so. No video file = neutral 50, reason says so.
+- **Combine** (defaults, tunable via Options `words_threshold` 50 /
+  `reaction_threshold` 40): keep only when words >= 50 AND reaction
+  >= 40; combined = round(0.6*words + 0.4*reaction); the old `score`
+  field IS the combined score. Every clip records words_score +
+  words_reason, reaction_score + reaction_reason + breakdown,
+  combined_score, judges_agree. Dropped candidates are listed in
+  the clips JSON (`dropped`, with which judge failed).
+- **Sentence splitting** (Phase 2 "count vs content" fix): long
+  Whisper segments are split into sentence pieces before windowing.
+  Same 128s test video: 5 segments -> 26 pieces, 4 candidates ->
+  24 candidates. Same 64.5s video: 3 segments -> 18 pieces,
+  2 candidates -> 12.
+- Real-run proof (16 Nov 2026): 128s English video, no Gemini key —
+  24 candidates, 13 after gate, 3 clips (words 65/56/51, reaction
+  68/70/70, combined 66/62/59); words_threshold=100 -> 0 clips;
+  invalid threshold -> 400. Quiet-contrast video (volume 0.2 for
+  30-60s): loud windows 84-97, quiet window 53 — reaction is
+  relative to the video's own median, so a half-quiet video's quiet
+  half still passes; the gate-both-ways proof is the controlled
+  fabricated-curve test (loud 85, quiet 14; high-words quiet
+  candidates dropped with "reaction judge fail").
+- Render still works end-to-end with the new scoring: clip_01
+  720p/Clean, 720x1280 h264 yuv420p 30fps, 42.67s, render `score`
+  field = 66 (combined).
+- Still NOT done: Phase 5 clip editor, Phase 6 BYOK ledger, Phase 7
+  live recorder, Phase 8 posting queue, Phase 10 deploy.
 
-Phase 3 dual-judge scoring · Phase 5 clip editor
-(trim/hook/re-make) · Phase 6 BYOK + token ledger · Phase 7 live
-recorder · Phase 8 posting queue · Phase 9 upgrades · Phase 10 polish +
-landing + legal pages + deploy.
+## Not done yet (Phases 5–10, see CLONE_PLAN.md §4)
+
+Phase 5 clip editor (trim/hook/re-make) · Phase 6 BYOK + token ledger ·
+Phase 7 live recorder · Phase 8 posting queue · Phase 9 upgrades ·
+Phase 10 polish + landing + legal pages + deploy.
 
 ## Blocked / needs the user
 

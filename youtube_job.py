@@ -1269,8 +1269,11 @@ def run_youtube_job(job_id: str) -> None:
         # --- find clips ---
         _update_job(job_id, status="finding_clips",
                     message="Viral clips dhoondh raha hoon…")
+        # Phase 3: pass the downloaded file so the Reaction judge can
+        # measure loudness (without it the reaction score is neutral 50).
         clips_data = find_clips(transcript, upload_id, top_n=top_n,
-                                language=language, options=job_options)
+                                language=language, options=job_options,
+                                video_path=video_path)
         clips = clips_data.get("clips", [])
         if not clips:
             raise ValueError(
