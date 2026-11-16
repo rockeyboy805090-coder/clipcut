@@ -97,6 +97,17 @@ DEFAULT_OPTIONS = {
     # DONO judge agree karein). Tunable via Options; defaults 50/40.
     "words_threshold": 50,
     "reaction_threshold": 40,
+    # Phase 5 tuning (see dual_judge.py + clip_finder._dedupe_rank):
+    # dedupe_overlap 0.6 = keep a window unless it overlaps >60% of
+    # the shorter clip with an already-picked one (was 0.4 — short
+    # videos returned fewer clips than asked).
+    # reaction_quiet_db / reaction_quiet_cap = quiet floor: a window
+    # whose speech mean is quieter than -38 dB gets its level factor
+    # capped at 0.25, so a half-quiet video's quiet half can't pass
+    # on a low median alone.
+    "dedupe_overlap": 0.6,
+    "reaction_quiet_db": -38.0,
+    "reaction_quiet_cap": 0.25,
 }
 
 # Hard limits from the task spec (validation, not defaults).
@@ -185,6 +196,29 @@ def parse_options(raw: dict | None, video_duration: float | None = None) -> dict
         if not 0 <= n <= 100:
             raise ValueError(f"Reaction threshold 0-100 ke beech hona chahiye — mila: {n}")
         opts["reaction_threshold"] = n
+
+    # --- Phase 5 tuning: dedupe overlap + reaction quiet floor ---
+    v = pick("dedupe_overlap")
+    if v is not None:
+        f = _as_float(v, "Dedupe overlap")
+        if not 0.1 <= f <= 0.9:
+            raise ValueError(
+                f"Dedupe overlap 0.1-0.9 ke beech hona chahiye — mila: {f}")
+        opts["dedupe_overlap"] = f
+    v = pick("reaction_quiet_db")
+    if v is not None:
+        f = _as_float(v, "Reaction quiet dB")
+        if not -60.0 <= f <= -20.0:
+            raise ValueError(
+                f"Reaction quiet dB -60 se -20 ke beech hona chahiye — mila: {f}")
+        opts["reaction_quiet_db"] = f
+    v = pick("reaction_quiet_cap")
+    if v is not None:
+        f = _as_float(v, "Reaction quiet cap")
+        if not 0.0 <= f <= 1.0:
+            raise ValueError(
+                f"Reaction quiet cap 0-1 ke beech hona chahiye — mila: {f}")
+        opts["reaction_quiet_cap"] = f
 
     # --- enums: invalid values are errors, never silent defaults ---
     v = pick("caption_style")
@@ -325,4 +359,7 @@ def options_summary(opts: dict) -> dict:
         "to_sec": o.get("to_sec"),
         "words_threshold": o.get("words_threshold", 50),
         "reaction_threshold": o.get("reaction_threshold", 40),
+        "dedupe_overlap": o.get("dedupe_overlap", 0.6),
+        "reaction_quiet_db": o.get("reaction_quiet_db", -38.0),
+        "reaction_quiet_cap": o.get("reaction_quiet_cap", 0.25),
     }

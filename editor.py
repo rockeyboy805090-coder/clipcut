@@ -332,29 +332,60 @@ def write_ass(phrases: list[dict], hook_line: str, profile: dict,
 
 
 def _caption_txt(clip: dict, style: dict, transcript_text: str) -> str:
-    hook = (clip.get("hook_line") or "").strip()
-    title = hook or "Viral clip"
-    if "baatien" in str(style.get("style_name", "")).lower():
-        tags = "#rajshamani #aura #podcasts #viralreels #trendingnow"
-    else:
-        tags = "#viralreels #reels #shorts #trendingnow"
-    preview = (transcript_text or "").strip()
-    if len(preview) > 300:
-        preview = preview[:300].rstrip() + "…"
-    return (f"{title}\n\n{preview}\n\n{tags}\n")
+    """Title + caption + hashtags, ready to paste.
+
+    Phase 5: uses the clip's EDITED metadata when present — title
+    (else hook_line), description (else transcript preview), hashtags
+    (else the style default). A re-make after an edit therefore
+    burns the edited text into the caption file, not the old hook.
+    """
+    title = (clip.get("title") or clip.get("hook_line") or "").strip() or "Viral clip"
+    description = (clip.get("description") or "").strip()
+    if not description:
+        description = (transcript_text or "").strip()
+        if len(description) > 300:
+            description = description[:300].rstrip() + "…"
+    tags = (clip.get("hashtags") or "").strip()
+    if not tags:
+        if "baatien" in str(style.get("style_name", "")).lower():
+            tags = "#rajshamani #aura #podcasts #viralreels #trendingnow"
+        else:
+            tags = "#viralreels #reels #shorts #trendingnow"
+    return (f"{title}\n\n{description}\n\n{tags}\n")
+
+
+def _existing_versions(out_dir: Path, clip_id: str) -> list[int]:
+    """Version numbers already on disk for one clip.
+
+    Versioned sidecars <clip_id>_v<N>.json count as N; a legacy flat
+    <clip_id>.json (Phase 3/4, pre-versioning) counts as version 1.
+    """
+    versions: list[int] = []
+    if (out_dir / f"{clip_id}.json").is_file():
+        versions.append(1)
+    for path in out_dir.glob(f"{clip_id}_v*.json"):
+        try:
+            versions.append(int(path.stem.rsplit("_v", 1)[1]))
+        except (ValueError, IndexError):
+            continue
+    return sorted(versions)
 
 
 def render_clip(video_path, upload_id: str, clip: dict,
                 style_name: str | None = None, transcript: dict | None = None,
                 caption_style: str | None = None, layout: str | None = None,
-                quality: str | None = None, options: dict | None = None) -> dict:
+                quality: str | None = None, options: dict | None = None,
+                version: int | None = None) -> dict:
     """Render ONE clip to 9:16 with captions + grading.
 
     Args:
         video_path: source long video file.
         upload_id: upload id (transcript lookup + output naming).
         clip: dict from clip_finder (clip_id, start, end, hook_line,
-            transcript_text, score).
+            transcript_text, score). Phase 5: start/end are the
+            EDITED (trimmed) values — render_clip renders exactly
+            that range; title/description/hashtags are the edited
+            metadata and go into the caption file.
         style_name: style slug or name; default "global-baatien".
         transcript: optional loaded transcript dict (loaded if None).
         caption_style / layout / quality: Phase 2 Options (see
@@ -363,8 +394,17 @@ def render_clip(video_path, upload_id: str, clip: dict,
             the dict. When nothing is passed, behaviour is the old
             one: Bounce captions, automatic reframe (face -> crop,
             else blur-fill), 1080x1920.
+        version: explicit version number, or None = next free version
+            (max existing + 1; first render is v1).
 
-    Returns a metadata dict and writes outputs/rendered/<clip_id>.*.
+    Phase 5 — VERSIONED renders: outputs are
+    outputs/rendered/<upload_id>/<clip_id>_v<N>.mp4/.srt/.ass/.txt/
+    _caption.txt/.json. A re-make NEVER overwrites the old render —
+    it writes a new version and the old files stay on disk. The
+    sidecar records version + created_at + the options used, so the
+    detail page can list every version with what changed.
+
+    Returns a metadata dict and writes the versioned files.
     Raises FileNotFoundError / ValueError / RuntimeError on bad input
     or a failed ffmpeg run (stderr tail included).
     """
@@ -442,17 +482,26 @@ def render_clip(video_path, upload_id: str, clip: dict,
     if not phrases:
         raise ValueError("Clip range me caption words nahi mile")
 
-    # Phase 5: per-upload namespace — outputs/rendered/<upload_id>/<clip_id>.*
+    # Phase 5 (clone): per-upload namespace — outputs/rendered/<upload_id>/<clip_id>.*
     # Old flat layout (outputs/rendered/<clip_id>.*) overwrote clip_01
     # of a previous upload. New renders never collide.
+    # Phase 5 (editor): VERSIONED files — <clip_id>_v<N>.*. A re-make
+    # writes a NEW version; the old render stays on disk untouched.
     out_dir = RENDERED_DIR / str(upload_id)
     out_dir.mkdir(parents=True, exist_ok=True)
-    mp4_path = out_dir / f"{clip_id}.mp4"
-    srt_path = out_dir / f"{clip_id}.srt"
-    ass_path = out_dir / f"{clip_id}.ass"
-    txt_path = out_dir / f"{clip_id}.txt"
-    cap_path = out_dir / f"{clip_id}_caption.txt"
-    json_path = out_dir / f"{clip_id}.json"
+    if version is None:
+        existing = _existing_versions(out_dir, clip_id)
+        version = (max(existing) + 1) if existing else 1
+    version = int(version)
+    if version < 1:
+        raise ValueError(f"Render version 1 ya usse bada hona chahiye — mila: {version}")
+    stem = f"{clip_id}_v{version}"
+    mp4_path = out_dir / f"{stem}.mp4"
+    srt_path = out_dir / f"{stem}.srt"
+    ass_path = out_dir / f"{stem}.ass"
+    txt_path = out_dir / f"{stem}.txt"
+    cap_path = out_dir / f"{stem}_caption.txt"
+    json_path = out_dir / f"{stem}.json"
 
     write_srt(phrases, srt_path)
     write_ass(phrases, str(clip.get("hook_line") or ""), style,
@@ -598,9 +647,14 @@ def render_clip(video_path, upload_id: str, clip: dict,
         language_note = "Captions in English words (Roman script) as requested."
     else:
         language_note = f"Captions in {caption_script} script as requested ({lang_requested})."
+    from datetime import datetime as _dt, timezone as _tz
     meta = {
         "clip_id": clip_id,
         "upload_id": upload_id,
+        # Phase 5 (editor): version + when it was rendered, so the
+        # detail page can list every re-make with what changed.
+        "version": version,
+        "created_at": _dt.now(_tz.utc).isoformat(),
         "language_requested": lang_requested,
         "language_note": language_note,
         "style_name": profile_name,
@@ -611,6 +665,10 @@ def render_clip(video_path, upload_id: str, clip: dict,
         "duration_sec": duration,
         "score": clip.get("score"),
         "hook_line": clip.get("hook_line"),
+        # Phase 5: the edited metadata that was actually rendered.
+        "title": (clip.get("title") or clip.get("hook_line") or ""),
+        "description": clip.get("description") or "",
+        "hashtags": clip.get("hashtags") or "",
         "output_mp4": str(mp4_path),
         "output_srt": str(srt_path),
         "output_ass": str(ass_path),
@@ -660,38 +718,110 @@ def render_clip(video_path, upload_id: str, clip: dict,
     return meta
 
 
-def find_render_info(upload_id: str, clip_id: str) -> dict | None:
-    """Sidecar for one (upload_id, clip_id), new layout first, then legacy."""
-    for path in (RENDERED_DIR / str(upload_id) / f"{clip_id}.json",
-                 RENDERED_DIR / f"{clip_id}.json"):
-        if path.is_file():
-            try:
-                meta = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+def _read_sidecar(path: Path, upload_id: str | None = None) -> dict | None:
+    """One sidecar JSON, or None (missing / bad JSON / wrong upload)."""
+    if not path.is_file():
+        return None
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if upload_id is not None and str(meta.get("upload_id")) != str(upload_id):
+        return None
+    return meta
+
+
+def list_render_versions(upload_id: str, clip_id: str) -> list[dict]:
+    """ALL render versions for one clip, oldest first.
+
+    Versioned sidecars <clip_id>_v<N>.json are versions N; a legacy
+    flat <clip_id>.json (pre-versioning) counts as version 1. Each
+    returned meta carries "version" (legacy: 1, "legacy": True).
+    Empty list = never rendered.
+    """
+    out_dir = RENDERED_DIR / str(upload_id)
+    versions: list[dict] = []
+    if out_dir.is_dir():
+        for path in sorted(out_dir.glob(f"{clip_id}_v*.json")):
+            meta = _read_sidecar(path, upload_id)
+            if meta is None:
                 continue
-            if str(meta.get("upload_id")) == str(upload_id):
-                return meta
-    return None
+            try:
+                meta = dict(meta)
+                meta.setdefault("version",
+                                int(path.stem.rsplit("_v", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+            versions.append(meta)
+    versions.sort(key=lambda m: int(m.get("version") or 0))
+    if not versions:
+        # Legacy flat render (Phase 3/4) counts as version 1.
+        for path in (out_dir / f"{clip_id}.json",
+                     RENDERED_DIR / f"{clip_id}.json"):
+            meta = _read_sidecar(path, upload_id)
+            if meta is not None:
+                meta = dict(meta)
+                meta.setdefault("version", 1)
+                meta["legacy"] = True
+                versions.append(meta)
+                break
+    return versions
 
 
-def load_render_info(clip_id: str, upload_id: str | None = None) -> dict:
+def find_render_info(upload_id: str, clip_id: str,
+                     version: int | None = None) -> dict | None:
+    """Sidecar for one (upload_id, clip_id).
+
+    version=None -> the LATEST version (highest N; legacy flat counts
+    as v1 when no versioned file exists). version=N -> that exact
+    version (legacy flat answers for N==1 when no v1 file exists).
+    Returns None when nothing is rendered yet.
+    """
+    out_dir = RENDERED_DIR / str(upload_id)
+    if version is not None:
+        version = int(version)
+        meta = _read_sidecar(out_dir / f"{clip_id}_v{version}.json", upload_id)
+        if meta is not None:
+            return meta
+        if version == 1:
+            for path in (out_dir / f"{clip_id}.json",
+                         RENDERED_DIR / f"{clip_id}.json"):
+                meta = _read_sidecar(path, upload_id)
+                if meta is not None:
+                    return meta
+        return None
+    versions = list_render_versions(upload_id, clip_id)
+    return versions[-1] if versions else None
+
+
+def load_render_info(clip_id: str, upload_id: str | None = None,
+                     version: int | None = None) -> dict:
     """Load saved render sidecar JSON; raises FileNotFoundError if absent.
 
-    With upload_id: namespaced path first, then legacy flat file.
-    Without: scan all sidecars (namespaced + legacy) for this clip_id
-    and return the first match — backwards compatible with Phase 3/4.
+    With upload_id: latest (or the requested version) in the
+    namespaced dir, then legacy flat file. Without: scan all sidecars
+    (namespaced + legacy) for this clip_id and return the highest
+    version found — backwards compatible with Phase 3/4.
     """
     if upload_id:
-        meta = find_render_info(str(upload_id), clip_id)
+        meta = find_render_info(str(upload_id), clip_id, version=version)
         if meta is not None:
             return meta
         raise FileNotFoundError(f"Rendered clip nahi mila: {clip_id} (upload {upload_id}) — pehle POST /render-clip karo")
+    best: dict | None = None
+    best_v = -1
     candidates = [RENDERED_DIR / f"{clip_id}.json"]
     candidates += sorted(RENDERED_DIR.glob(f"*/{clip_id}.json"))
+    candidates += sorted(RENDERED_DIR.glob(f"*/{clip_id}_v*.json"))
     for path in candidates:
-        if path.is_file():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
+        meta = _read_sidecar(path)
+        if meta is None:
+            continue
+        v = int(meta.get("version") or 1)
+        if version is not None and v != int(version):
+            continue
+        if v > best_v:
+            best, best_v = meta, v
+    if best is not None:
+        return best
     raise FileNotFoundError(f"Rendered clip nahi mila: {clip_id} — pehle POST /render-clip karo")

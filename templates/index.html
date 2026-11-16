@@ -357,6 +357,7 @@ function renderClips(data){
   head.className = 'text-sm text-zinc-400';
   head.textContent = 'Scoring: ' + (data.scoring_method || '?') + ' · language: ' + (data.scoring_language || 'en') + ' · ' + (data.clips || []).length + ' clips';
   box.appendChild(head);
+  const uid = document.querySelector('#clip-upload-id').value;
   (data.clips || []).forEach(c => {
     const div = document.createElement('div');
     div.className = 'rounded-xl border border-zinc-700 bg-black p-4';
@@ -366,7 +367,8 @@ function renderClips(data){
       '<span class="text-amber-300">Hook: ' + (c.hook_line || '') + '</span><br>' +
       '<span class="text-zinc-400 text-sm">' + (c.reason || '') + '</span><br>' +
       '<span class="text-zinc-300 text-sm">' + (c.transcript_text || '').slice(0, 300) + '</span></span></label>' +
-      '<div class="mt-3 flex gap-2"><button data-act="approve" data-cid="' + c.clip_id + '" class="rounded-lg bg-emerald-600 px-3 py-1 text-sm font-semibold">Approve</button>' +
+      '<div class="mt-3 flex gap-2"><a href="/app/videos/' + uid + '/clips/' + c.clip_id + '" class="rounded-lg bg-violet-600 px-3 py-1 text-sm font-semibold">Open editor →</a>' +
+      '<button data-act="approve" data-cid="' + c.clip_id + '" class="rounded-lg bg-emerald-600 px-3 py-1 text-sm font-semibold">Approve</button>' +
       '<button data-act="reject" data-cid="' + c.clip_id + '" class="rounded-lg bg-zinc-700 px-3 py-1 text-sm font-semibold">Reject</button></div>';
     box.appendChild(div);
   });

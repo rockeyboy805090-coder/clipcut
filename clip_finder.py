@@ -515,8 +515,18 @@ def _reason(breakdown: dict, score: int, language: str = "en") -> str:
     return f"Score {score}/100 — " + ", ".join(parts)
 
 
-def _dedupe_rank(candidates: list[dict], top_n: int) -> list[dict]:
-    """Rank by score, suppress windows overlapping >40% with a picked one."""
+def _dedupe_rank(candidates: list[dict], top_n: int,
+                 overlap_threshold: float = 0.6) -> list[dict]:
+    """Rank by score, suppress windows overlapping more than
+    overlap_threshold of the SHORTER clip with a picked one.
+
+    Phase 5: default 0.6 (was 0.4). At 0.4, en12's 13 gate-kept
+    windows yielded only 3 clips for top_n=4 — windows that are
+    40-60% the same content blocked each other. At 0.6 a window is
+    kept unless it is mostly a duplicate of a picked one, so the
+    requested count is met more often while near-duplicates still
+    get suppressed. Tunable via Options dedupe_overlap (0.1-0.9).
+    """
     ranked = sorted(candidates, key=lambda c: (-c["score"], c["start"]))
     picked: list[dict] = []
     for cand in ranked:
@@ -524,7 +534,7 @@ def _dedupe_rank(candidates: list[dict], top_n: int) -> list[dict]:
         for p in picked:
             inter = max(0.0, min(cand["end"], p["end"]) - max(cand["start"], p["start"]))
             shorter = min(cand["duration"], p["duration"])
-            if shorter > 0 and inter / shorter > 0.4:
+            if shorter > 0 and inter / shorter > overlap_threshold:
                 overlap = True
                 break
         if not overlap:
@@ -682,6 +692,10 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
     top_n = max(1, min(8, int(top_n or 5)))
     words_threshold = int((options or {}).get("words_threshold", 50))
     reaction_threshold = int((options or {}).get("reaction_threshold", 40))
+    # Phase 5 tuning (see options.py): finer dedupe + quiet floor.
+    dedupe_overlap = float((options or {}).get("dedupe_overlap", 0.6))
+    quiet_db = (options or {}).get("reaction_quiet_db", -38.0)
+    quiet_cap = (options or {}).get("reaction_quiet_cap", 0.25)
     lang = (language or transcript.get("language_requested") or "en").lower()
     if lang not in ("en", "hinglish", "hi"):
         lang = "en"
@@ -736,7 +750,8 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
     for cand in candidates:
         rj = reaction_judge(cand["start"], cand["end"], curve,
                             chat_activity=chat_activity,
-                            video_duration=video_duration)
+                            video_duration=video_duration,
+                            quiet_db=quiet_db, quiet_cap=quiet_cap)
         cand["reaction_score"] = int(rj["score"])
         cand["reaction_reason"] = rj["reason"]
         cand["reaction_breakdown"] = rj["breakdown"]
@@ -774,7 +789,7 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
                 "combined_score": cand["combined_score"],
                 "reason": "; ".join(why),
             })
-    picked = _dedupe_rank(kept, top_n)
+    picked = _dedupe_rank(kept, top_n, overlap_threshold=dedupe_overlap)
     clips = []
     for idx, cand in enumerate(picked, start=1):
         hook = cand.get("gemini_hook") or _hook_line(cand["text"])
@@ -797,6 +812,16 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
                 f"Combined {cand['combined_score']}/100 — "
                 f"{cand['words_reason']}"),
             "hook_line": hook,
+            # Phase 5: editable metadata — defaults equal what the
+            # caption file used to generate (title = hook, description
+            # = transcript preview, hashtags = default tags). The
+            # editor overwrites these; re-make uses them.
+            "title": hook,
+            "description": (cand["text"][:300].rstrip() + "…"
+                            if len(cand["text"]) > 300 else cand["text"]),
+            "hashtags": "#viralreels #reels #shorts #trendingnow",
+            "source": "ai",
+            "gated": True,
             "transcript_text": cand["text"],
             "scoring_method": scoring_method,
             "scoring_language": lang,
@@ -820,12 +845,18 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
             "quality": (options or {}).get("quality", "720p"),
             "words_threshold": words_threshold,
             "reaction_threshold": reaction_threshold,
+            "dedupe_overlap": dedupe_overlap,
+            "reaction_quiet_db": quiet_db,
+            "reaction_quiet_cap": quiet_cap,
         },
         "judges": {
             "words_judge": words_judge,
             "reaction_judge": reaction_judge_name,
             "words_threshold": words_threshold,
             "reaction_threshold": reaction_threshold,
+            "dedupe_overlap": dedupe_overlap,
+            "reaction_quiet_db": quiet_db,
+            "reaction_quiet_cap": quiet_cap,
             "combine": ("clip tabhi jab dono judge agree karein "
                         f"(words >= {words_threshold} AND reaction >= "
                         f"{reaction_threshold}); combined = "
@@ -883,6 +914,159 @@ def load_clips(upload_id: str) -> dict:
             clip["combined_score"] = clip.get("score")
             clip["judges_agree"] = None
             changed = True
+        # Phase 5 backfill: editable metadata + source, for clips
+        # written before the editor existed.
+        if "title" not in clip:
+            clip["title"] = clip.get("hook_line") or "Viral clip"
+            changed = True
+        if "description" not in clip:
+            txt = str(clip.get("transcript_text") or "")
+            clip["description"] = (txt[:300].rstrip() + "…"
+                                   if len(txt) > 300 else txt)
+            changed = True
+        if "hashtags" not in clip:
+            clip["hashtags"] = "#viralreels #reels #shorts #trendingnow"
+            changed = True
+        if "source" not in clip:
+            clip["source"] = "ai"
+            clip["gated"] = True
+            changed = True
     if changed:
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     return data
+
+
+def save_clips(upload_id: str, data: dict) -> dict:
+    """Persist a clips dict to outputs/clips/<upload_id>_clips.json.
+
+    Phase 5: the editor (metadata edits, trim, hand clips) writes
+    through here — find_clips is no longer the only writer.
+    """
+    CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+    path = CLIPS_DIR / f"{upload_id}_clips.json"
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+    return data
+
+
+def update_clip(upload_id: str, clip_id: str, updates: dict) -> dict:
+    """Apply `updates` to one clip and persist. Raises FileNotFoundError
+    (no clips file) or KeyError (no such clip). Only the keys in
+    `updates` change — everything else stays as it was."""
+    data = load_clips(upload_id)
+    for clip in data.get("clips", []):
+        if str(clip.get("clip_id")) == str(clip_id):
+            clip.update(updates)
+            save_clips(upload_id, data)
+            return clip
+    raise KeyError(f"clip not found: {clip_id}")
+
+
+def score_window(transcript: dict, video_path, start: float, end: float,
+                 language: str = "en") -> dict:
+    """Score ONE window with both judges, WITHOUT the gate.
+
+    Used for hand clips (Phase 5): the scores are informational —
+    a hand clip is kept whatever they say, and `gated` is False.
+    Rule-based words score (no Gemini call here — hand clips are
+    manual, the AI hook/title call happens in Phase 6's ledger as
+    "Hand clip: title and hook"). Reaction is loudness-only unless
+    a curve can't be measured (then neutral 50, reason says so).
+    """
+    from dual_judge import extract_loudness_curve, reaction_judge
+
+    words = transcript.get("words") or []
+    text = " ".join(str(w.get("word") or "") for w in words
+                    if float(w.get("end", 0)) > start
+                    and float(w.get("start", 0)) < end).strip()
+    first = _first_seconds_text(words, start) if words else text[:80]
+    rule_score, breakdown = score_candidate(text, first, end - start,
+                                            language)
+    words_reason = _reason(breakdown, rule_score, language)
+    curve = None
+    video_duration = None
+    if video_path is not None:
+        try:
+            curve = extract_loudness_curve(video_path)
+            video_duration = curve.get("duration")
+        except Exception:
+            curve = None
+    if video_duration is None and words:
+        try:
+            video_duration = float(words[-1]["end"])
+        except Exception:
+            video_duration = None
+    rj = reaction_judge(start, end, curve, video_duration=video_duration)
+    combined = int(round(0.6 * rule_score + 0.4 * int(rj["score"])))
+    return {"words_score": int(rule_score), "words_reason": words_reason,
+            "words_judge": "rule_based",
+            "reaction_score": int(rj["score"]),
+            "reaction_reason": rj["reason"],
+            "reaction_breakdown": rj["breakdown"],
+            "combined_score": combined, "score": combined,
+            "transcript_text": text}
+
+
+def create_hand_clip(transcript: dict, upload_id: str, video_path,
+                     start: float, end: float, hook: str | None = None,
+                     title: str | None = None,
+                     description: str | None = None,
+                     hashtags: str | None = None,
+                     language: str = "en") -> dict:
+    """Create a MANUAL clip from [start, end] — no AI gate.
+
+    Validates the range (start < end, duration >= 5s) and appends a
+    hand_XX clip to the clips file (creating a minimal clips file if
+    /find-clips never ran). Scores are informational only (see
+    score_window); the clip is kept whatever they say.
+    Raises ValueError on a bad range.
+    """
+    start, end = float(start), float(end)
+    if end <= start:
+        raise ValueError(
+            f"Hand clip ka end ({end}s) start ({start}s) se bada hona chahiye")
+    if end - start < 5:
+        raise ValueError(
+            f"Hand clip kam se kam 5 seconds ka hona chahiye — mila: {end - start:.1f}s")
+    try:
+        data = load_clips(upload_id)
+    except FileNotFoundError:
+        data = {"upload_id": upload_id, "scoring_method": "hand",
+                "scoring_language": language, "clips": [], "dropped": []}
+    taken = {str(c.get("clip_id")) for c in data.get("clips", [])}
+    n = 1
+    while f"hand_{n:02d}" in taken:
+        n += 1
+    clip_id = f"hand_{n:02d}"
+    scored = score_window(transcript, video_path, start, end, language)
+    hook_line = (hook or "").strip() or _hook_line(scored["transcript_text"])
+    clip = {
+        "clip_id": clip_id, "start": round(start, 2), "end": round(end, 2),
+        "duration": round(end - start, 2),
+        "score": scored["score"], "combined_score": scored["combined_score"],
+        "words_score": scored["words_score"],
+        "words_reason": scored["words_reason"],
+        "words_judge": scored["words_judge"],
+        "reaction_score": scored["reaction_score"],
+        "reaction_reason": scored["reaction_reason"],
+        "reaction_breakdown": scored["reaction_breakdown"],
+        "judges_agree": None,
+        "reason": (f"Hand clip — AI gate nahi lagaya gaya. "
+                   f"Words {scored['words_score']}/100; "
+                   f"Reaction {scored['reaction_score']}/100; "
+                   f"Combined {scored['combined_score']}/100."),
+        "hook_line": hook_line,
+        "title": (title or "").strip() or hook_line,
+        "description": (description or "").strip()
+                       or scored["transcript_text"][:300],
+        "hashtags": (hashtags or "").strip()
+                    or "#viralreels #reels #shorts #trendingnow",
+        "source": "hand", "gated": False,
+        "transcript_text": scored["transcript_text"],
+        "scoring_method": "rule_based",
+        "scoring_language": language,
+        "breakdown": None,
+    }
+    data.setdefault("clips", []).append(clip)
+    save_clips(upload_id, data)
+    return clip

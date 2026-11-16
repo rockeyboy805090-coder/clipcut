@@ -138,21 +138,17 @@ def list_rendered_for_upload(upload_id: str) -> list[dict]:
 
 
 def is_clip_rendered_for_upload(upload_id: str, clip_id: str) -> dict | None:
-    """Sidecar for this (upload_id, clip_id) if the MP4 exists, else None.
+    """Latest render sidecar for this (upload_id, clip_id) if its MP4
+    exists, else None.
 
-    Phase 5: checks the namespaced path first, then the legacy flat
-    path, then any sidecar found by recursive scan.
+    Phase 5 (editor): version-aware — resolves the LATEST version
+    (list_render_versions in editor.py), so a re-made clip still
+    counts as rendered and /render-all skips it instead of rendering
+    it a third time. Legacy flat sidecars still resolve (v1).
     """
-    for path in (RENDERED_DIR / str(upload_id) / f"{clip_id}.json",
-                 RENDERED_DIR / f"{clip_id}.json"):
-        if not path.is_file():
-            continue
-        try:
-            meta = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if str(meta.get("upload_id")) != str(upload_id):
-            continue
+    from editor import list_render_versions  # local: avoids import cycles
+
+    for meta in reversed(list_render_versions(upload_id, clip_id)):
         mp4 = Path(str(meta.get("output_mp4", "")))
         if mp4.is_file():
             return meta
@@ -193,7 +189,9 @@ def get_project_status(upload_id: str, upload_row: dict | None = None) -> dict:
     approved = [c for c, a in approvals.items() if a["status"] == "approved"]
     rejected = [c for c, a in approvals.items() if a["status"] == "rejected"]
     rendered = list_rendered_for_upload(upload_id)
-    rendered_ids = [str(m.get("clip_id")) for m in rendered]
+    # Phase 5 (editor): one clip can have several versions now — the
+    # status counts CLIPS, not versions.
+    rendered_ids = sorted({str(m.get("clip_id")) for m in rendered})
     all_rendered = bool(clip_ids) and all(c in rendered_ids for c in clip_ids)
 
     if not has_transcript:

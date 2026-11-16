@@ -22,6 +22,7 @@ V2 (16 Nov 2026): YouTube link -> fully edited clips, automatically —
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import io
 import os
 import sqlite3
@@ -47,8 +48,10 @@ from auth import (SESSION_COOKIE, STORAGE_QUOTA_BYTES, create_creator,
 from style_extractor import (ensure_default_profile, extract_style,
                              list_styles, load_style, save_profile)
 from transcriber import load_transcript, transcribe
-from clip_finder import find_clips, load_clips
-from editor import find_render_info, load_render_info, render_clip
+from clip_finder import (create_hand_clip, find_clips, load_clips,
+                         update_clip)
+from editor import (find_render_info, list_render_versions,
+                    load_render_info, render_clip)
 from options import (CAPTION_STYLES, LAYOUTS, QUALITIES, VIDEO_TYPES,
                      options_summary, parse_options)
 from utils import ffmpeg_status, probe_video, slugify
@@ -93,7 +96,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ClipCut", version="0.9.0-phase3", lifespan=lifespan)
+app = FastAPI(title="ClipCut", version="0.10.0-phase5", lifespan=lifespan)
 
 
 def init_db() -> None:
@@ -134,7 +137,7 @@ def health() -> JSONResponse:
     # --version + one --list-impersonate-targets at first call) —
     # cheap, and they prove on the LIVE instance whether node and
     # browser impersonation are actually available there.
-    return JSONResponse({"status": "ok", "phase": 3, "app": "clipcut-phase3",
+    return JSONResponse({"status": "ok", "phase": 5, "app": "clipcut-phase5",
                          "ffmpeg": ffmpeg_status(),
                          "youtube": youtube_runtime_diagnostics(),
                          "auth": {"google_configured": google_oauth_configured()}})
@@ -968,6 +971,13 @@ h1{margin:0;font-size:28px;text-transform:uppercase;letter-spacing:.02em}
 h3{margin:0 0 8px}
 table{width:100%;border-collapse:collapse;font-size:14px}
 td,th{padding:8px 4px;border-bottom:1px solid #262c5e;text-align:left}
+video{width:100%;max-width:480px;border-radius:12px;background:#000}
+textarea{width:100%;background:#0d1230;border:1px solid #3b4380;border-radius:10px;color:#fff;padding:10px;margin-top:6px;box-sizing:border-box;font-family:sans-serif}
+.scorebig{font-size:44px;font-weight:800}
+.chip{display:inline-block;background:#262c5e;border-radius:999px;padding:4px 12px;font-size:13px;margin:2px 4px 2px 0}
+.chip.ok{background:#065f46}.chip.bad{background:#7f1d1d}.chip.warn{background:#78350f}
+.scorebar{height:8px;background:#1e2450;border-radius:4px;overflow:hidden;margin:4px 0 10px}
+.scorebar i{display:block;height:100%;background:#ff2e63}
 .optrow{display:flex;gap:10px;flex-wrap:wrap}.optrow>div{flex:1;min-width:140px}
 .radio label{display:inline-block;margin:6px 14px 0 0;color:#e5e7eb}
 .radio input{width:auto;margin-right:4px}
@@ -1348,10 +1358,21 @@ def all_videos(request: Request, creator: str | None = None) -> HTMLResponse:
             continue
         rows.append(p)
     if rows:
-        body_rows = "".join(
-            f"<tr><td>{p.get('id','')[:8]}…</td><td>{p.get('status','')}</td>"
-            f"<td>{len(p.get('clips', []))}</td></tr>" for p in rows)
-        table = ("<table><tr><th>Video</th><th>Status</th><th>Clips</th></tr>"
+        body_rows = ""
+        for p in rows:
+            # Phase 5: clips with scores, each linking to its editor.
+            try:
+                clips = load_clips(p["id"]).get("clips", [])
+            except FileNotFoundError:
+                clips = []
+            clip_links = " · ".join(
+                f"<a href=\"/app/videos/{p['id']}/clips/{c['clip_id']}\">"
+                f"{c['clip_id']} ({_fmt_score(c.get('combined_score', c.get('score')))})</a>"
+                for c in clips) or "<span class=\"muted\">koi clip nahi</span>"
+            body_rows += (
+                f"<tr><td><a href=\"/app/videos/{p['id']}\">{p.get('id','')[:8]}…</a></td>"
+                f"<td>{p.get('status','')}</td><td>{clip_links}</td></tr>")
+        table = ("<table><tr><th>Video</th><th>Status</th><th>Clips (score)</th></tr>"
                  + body_rows + "</table>")
     else:
         table = "<p class=\"muted\">No videos yet — Add a video above to see it here.</p>"
@@ -1368,6 +1389,553 @@ def all_videos(request: Request, creator: str | None = None) -> HTMLResponse:
             f"<p><a class=\"btn\" href=\"/app\">＋ Add a video</a> "
             f"<a class=\"btn ghost\" href=\"/\">Open classic studio</a></p>")
     return _app_layout(user, "All videos", body)
+
+
+# ---------------------------------------------------------- Phase 5: clip editor
+
+def _upload_owner(upload_id: str) -> str | None:
+    """Owner user_id of an upload, or None (legacy / no owner)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute("SELECT user_id FROM uploads WHERE id=?",
+                           (upload_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _owns_upload(request: Request, upload_id: str) -> bool:
+    """True when the caller may open this upload (owner, or no owner)."""
+    owner = _upload_owner(upload_id)
+    if owner is None:
+        return True
+    user = _current_user(request)
+    return user is not None and user["id"] == owner
+
+
+def _validate_trim(start, end, duration: float,
+                   cur_start: float, cur_end: float) -> tuple[float, float]:
+    """Validate trim start/end (seconds) against the source duration.
+
+    None keeps the clip's current value. Rules (Hinglish 400s):
+    start >= 0, end <= duration, end > start, end - start >= 5s.
+    Returns (start, end) floats.
+    """
+    s = cur_start if start is None or str(start) == "" else float(start)
+    e = cur_end if end is None or str(end) == "" else float(end)
+    if s < 0:
+        raise ValueError(f"Trim start 0 ya usse zyada hona chahiye — mila: {s}s")
+    if e > duration:
+        raise ValueError(
+            f"Trim end ({e}s) video ki length ({duration:.1f}s) se zyada nahi ho sakta")
+    if e <= s:
+        raise ValueError(f"Trim end ({e}s) start ({s}s) se bada hona chahiye")
+    if e - s < 5:
+        raise ValueError(
+            f"Trimmed clip kam se kam 5 seconds ka hona chahiye — mila: {e - s:.1f}s")
+    return round(s, 2), round(e, 2)
+
+
+async def _read_body(request: Request) -> dict:
+    """JSON body or form fields, as one dict (editor endpoints take both)."""
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            data = await request.json()
+            return dict(data) if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    try:
+        form = await request.form()
+        return {k: v for k, v in form.multi_items()}
+    except Exception:
+        return {}
+
+
+def _clip_or_404(upload_id: str, clip_id: str) -> tuple[dict, dict]:
+    """(clips_data, clip) or raises 404."""
+    try:
+        clips_data = load_clips(upload_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    clip = next((c for c in clips_data.get("clips", [])
+                 if str(c.get("clip_id")) == str(clip_id)), None)
+    if not clip:
+        raise HTTPException(
+            status_code=404,
+            detail=f"clip not found: {clip_id} — pehle POST /find-clips karo")
+    return clips_data, clip
+
+
+def _fmt_score(v) -> str:
+    return "—" if v is None else f"{int(v)}/100"
+
+
+def _clip_detail_body(user: dict, upload_id: str, clip: dict,
+                      versions: list[dict], error: str = "",
+                      saved: bool = False) -> str:
+    """HTML body for the clip detail page (score + judges + editor)."""
+    esc = _html.escape
+    row = _get_upload_row(upload_id)
+    duration = 0.0
+    if row:
+        probe = probe_video(ROOT / row["stored_path"])
+        duration = probe["duration"] if probe["valid"] else 0.0
+    ws, rs = clip.get("words_score"), clip.get("reaction_score")
+    combined = clip.get("combined_score", clip.get("score"))
+    agree = clip.get("judges_agree")
+    agree_chip = ('<span class="chip ok">✅ Both judges agree</span>' if agree is True
+                  else '<span class="chip bad">❌ Gate fail (dropped hota)</span>' if agree is False
+                  else '<span class="chip warn">Hand clip — gate nahi laga</span>')
+    source = str(clip.get("source") or "ai")
+    rb = clip.get("reaction_breakdown") or {}
+    latest = versions[-1] if versions else None
+    if latest:
+        preview = (f'<video controls src="/rendered/{upload_id}/{clip["clip_id"]}">'
+                   f'</video><p class="muted">Latest render — v{latest.get("version", 1)} '
+                   f'({latest.get("resolution", "?")}, {latest.get("duration_sec", "?")}s)</p>')
+    else:
+        preview = (f'<video controls preload="metadata" '
+                   f'src="/app/videos/{upload_id}/source#t={clip["start"]},{clip["end"]}">'
+                   f'</video><p class="muted">Abhi tak render nahi hua — source ka '
+                   f'clip range preview ({clip["start"]}s – {clip["end"]}s).</p>')
+    if versions:
+        ver_rows = "".join(
+            f"<tr><td>v{v.get('version', '?')}</td>"
+            f"<td>{esc(str(v.get('resolution', '?')))}</td>"
+            f"<td>{esc(str(v.get('caption_style', '?')))}</td>"
+            f"<td>{esc(str(v.get('layout', '?')))}</td>"
+            f"<td>{v.get('duration_sec', '?')}s</td>"
+            f"<td>{(int(v.get('file_size_bytes') or 0) // 1024)} KB</td>"
+            f"<td><a href=\"/rendered/{upload_id}/{clip['clip_id']}/v/{v.get('version', 1)}\">MP4</a> · "
+            f"<a href=\"/rendered/{upload_id}/{clip['clip_id']}/v/{v.get('version', 1)}/srt\">SRT</a> · "
+            f"<a href=\"/rendered/{upload_id}/{clip['clip_id']}/v/{v.get('version', 1)}/caption\">Caption</a></td></tr>"
+            for v in versions)
+        ver_html = ("<table><tr><th>Version</th><th>Resolution</th><th>Caption</th>"
+                    "<th>Layout</th><th>Duration</th><th>Size</th><th>Download</th></tr>"
+                    + ver_rows + "</table>"
+                    "<p class=\"muted\">Latest version upar preview me hai — "
+                    "re-make purana version overwrite nahi karta, naya version banta hai.</p>")
+    else:
+        ver_html = ("<p class=\"muted\">Abhi koi render nahi hai — neeche "
+                    "Re-make dabakar pehla render banao.</p>")
+    err_html = f'<p class="err">{esc(error)}</p>' if error else ""
+    ok_html = '<p style="color:#4ade80">Saved ✓</p>' if saved else ""
+    cap_opts = "".join(
+        f'<option value="{k}"{" selected" if k == (latest or {}).get("caption_style", clip.get("caption_style", "bounce")) else ""}>{v["label"]}</option>'
+        for k, v in CAPTION_STYLES.items())
+    lay_opts = "".join(
+        f'<option value="{k}"{" selected" if k == (latest or {}).get("layout", "blurred_fill") else ""}>{v["label"]}</option>'
+        for k, v in LAYOUTS.items())
+    qual_opts = "".join(
+        f'<option value="{k}"{" selected" if k == (latest or {}).get("quality", "720p") else ""}>{v["label"]}</option>'
+        for k, v in QUALITIES.items())
+    return f"""
+<h1>{esc(str(clip.get('clip_id')))} — {esc(str(clip.get('title') or clip.get('hook_line') or ''))}</h1>
+<p class="muted"><a href="/app/videos/{upload_id}">← Back to video</a> · {esc(str(row.get('original_name') if row else ''))} · {clip['start']}s – {clip['end']}s ({clip['duration']}s) · Source: {esc(source)}</p>
+{err_html}{ok_html}
+<div class="card">{preview}</div>
+<div class="card"><h3>Score — Combined <span class="scorebig">{_fmt_score(combined)}</span></h3>
+<p>{agree_chip}</p>
+<p><b>Words judge:</b> {_fmt_score(ws)}</p>
+<div class="scorebar"><i style="width:{int(ws) if ws is not None else 0}%"></i></div>
+<p class="muted">{esc(str(clip.get('words_reason') or ''))}</p>
+<p><b>Reaction judge:</b> {_fmt_score(rs)}</p>
+<div class="scorebar"><i style="width:{int(rs) if rs is not None else 0}%"></i></div>
+<p class="muted">{esc(str(clip.get('reaction_reason') or ''))}</p>
+<p class="muted">Loudness: mean {rb.get('mean_db', '?')} dB · median {rb.get('median_db', '?')} dB · speech {rb.get('speech_fraction', '?')} · crest {rb.get('crest_db', '?')} dB · level {rb.get('level_factor', '?')}{' · quiet floor cap laga' if rb.get('quiet_cap_applied') else ''}</p>
+<p class="muted">Thresholds: words ≥ 50 · reaction ≥ 40 · Combined = 0.6·words + 0.4·reaction</p></div>
+<div class="card"><h3>Hook, title, description, hashtags</h3>
+<form method="post" action="/app/videos/{upload_id}/clips/{clip['clip_id']}/edit">
+<label>Hook (on-screen, first 2s)<input name="hook_line" value="{esc(str(clip.get('hook_line') or ''))}"></label>
+<label>Title<input name="title" value="{esc(str(clip.get('title') or ''))}"></label>
+<label>Description<textarea name="description" rows="3">{esc(str(clip.get('description') or ''))}</textarea></label>
+<label>Hashtags<input name="hashtags" value="{esc(str(clip.get('hashtags') or ''))}"></label>
+<button class="btn" type="submit">Save metadata</button></form>
+<p class="muted">Save karne se caption file aur agla render yehi text use karenge.</p></div>
+<div class="card"><h3>Trim &amp; Re-make</h3>
+<p class="muted">Video length: {duration:.1f}s · Trim kam se kam 5s ka hona chahiye.</p>
+<form id="remake-form">
+<label>Trim start (seconds)<input id="rm-start" type="number" min="0" step="0.1" value="{clip['start']}"></label>
+<label>Trim end (seconds)<input id="rm-end" type="number" min="0" step="0.1" value="{clip['end']}"></label>
+<div class="optrow"><div><label>Caption style<select id="rm-caption">{cap_opts}</select></label></div>
+<div><label>Frame layout<select id="rm-layout">{lay_opts}</select></label></div>
+<div><label>Video quality<select id="rm-quality">{qual_opts}</select></label></div></div>
+<p id="rm-status" class="muted"></p>
+<p id="rm-error" class="err"></p>
+<button class="btn" type="submit">Save &amp; Re-make</button>
+<button class="btn ghost" type="button" id="rm-save-trim">Save trim only</button></form>
+<p class="muted">Re-make 1-3 min leta hai (CPU render). Purana render delete nahi hota — naya version banta hai, neeche Versions me dikhega.</p></div>
+<div class="card"><h3>Versions ({len(versions)})</h3>{ver_html}
+<p><a class="btn ghost" href="/download/{upload_id}/{clip['clip_id']}">Download latest (ZIP)</a> '
+<a class="btn ghost" href="/rendered/{upload_id}/{clip['clip_id']}">Download latest MP4</a></p></div>
+<div class="card"><h3>Approve / Reject</h3>
+<form method="post" action="/approve-clip" style="display:inline">
+<input type="hidden" name="upload_id" value="{upload_id}">
+<input type="hidden" name="clip_id" value="{clip['clip_id']}">
+<button class="btn" type="submit">Approve test clip</button></form>
+<form method="post" action="/reject-clip" style="display:inline">
+<input type="hidden" name="upload_id" value="{upload_id}">
+<input type="hidden" name="clip_id" value="{clip['clip_id']}">
+<button class="btn ghost" type="submit">Reject</button></form>
+<p class="muted">Approve karne se Render All unlock hota hai.</p></div>
+<script>
+const UID = "{upload_id}", CID = "{clip['clip_id']}";
+document.getElementById('remake-form').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const st = document.getElementById('rm-status'), er = document.getElementById('rm-error');
+  er.textContent = ''; st.textContent = 'Rendering… 1-3 min lag sakte hain, page band mat karo.';
+  const body = {{upload_id: UID, clip_id: CID,
+    start: Number(document.getElementById('rm-start').value),
+    end: Number(document.getElementById('rm-end').value),
+    caption_style: document.getElementById('rm-caption').value,
+    layout: document.getElementById('rm-layout').value,
+    quality: document.getElementById('rm-quality').value}};
+  try {{
+    const r = await fetch('/remake-clip', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+    const j = await r.json();
+    if (!r.ok) {{ er.textContent = 'Error: ' + (j.detail || 're-make fail hua'); st.textContent = ''; return; }}
+    st.textContent = 'Re-make ho gaya — v' + j.version + ' (' + j.resolution + '). Page reload ho raha hai…';
+    setTimeout(() => location.reload(), 800);
+  }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err; }}
+}});
+document.getElementById('rm-save-trim').addEventListener('click', async () => {{
+  const st = document.getElementById('rm-status'), er = document.getElementById('rm-error');
+  er.textContent = ''; st.textContent = 'Trim save ho raha hai…';
+  const body = {{start: Number(document.getElementById('rm-start').value),
+    end: Number(document.getElementById('rm-end').value)}};
+  try {{
+    const r = await fetch('/app/videos/' + UID + '/clips/' + CID + '/edit', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+    const j = await r.json();
+    if (!r.ok) {{ er.textContent = 'Error: ' + (j.detail || 'trim save nahi hua'); st.textContent = ''; return; }}
+    st.textContent = 'Trim saved ✓ — ab Re-make dabao ya page reload karo.';
+  }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err; }}
+}});
+</script>
+"""
+
+
+@app.get("/app/videos/{upload_id}", response_class=HTMLResponse)
+def video_detail(request: Request, upload_id: str) -> HTMLResponse:
+    """One video: all its clips with scores + Hand clip form."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    row = _get_upload_row(upload_id)
+    if not row:
+        return HTMLResponse("<h1>Video not found</h1>", status_code=404)
+    if not _owns_upload(request, upload_id):
+        return RedirectResponse("/login", status_code=303)
+    try:
+        clips_data = load_clips(upload_id)
+        clips = clips_data.get("clips", [])
+    except FileNotFoundError:
+        clips_data, clips = {}, []
+    probe = probe_video(ROOT / row["stored_path"])
+    duration = probe["duration"] if probe["valid"] else 0.0
+    if clips:
+        clip_rows = "".join(
+            f"<tr><td><a href=\"/app/videos/{upload_id}/clips/{c['clip_id']}\">{c['clip_id']}</a></td>"
+            f"<td>{c['start']}s – {c['end']}s</td><td>{c['duration']}s</td>"
+            f"<td><b>{_fmt_score(c.get('combined_score', c.get('score')))}</b></td>"
+            f"<td>{_fmt_score(c.get('words_score'))}</td>"
+            f"<td>{_fmt_score(c.get('reaction_score'))}</td>"
+            f"<td>{_html.escape(str(c.get('source') or 'ai'))}</td>"
+            f"<td><a href=\"/app/videos/{upload_id}/clips/{c['clip_id']}\">Open editor →</a></td></tr>"
+            for c in clips)
+        table = ("<table><tr><th>Clip</th><th>Window</th><th>Length</th>"
+                 "<th>Combined</th><th>Words</th><th>Reaction</th><th>Source</th><th></th></tr>"
+                 + clip_rows + "</table>")
+    else:
+        table = ("<p class=\"muted\">Abhi koi clip nahi hai — classic studio "
+                 "se pehle transcribe + find-clips karo, ya neeche Hand clip banao.</p>")
+    body = f"""<h1>{_html.escape(str(row['original_name']))}</h1>
+<p class="muted"><a href="/app/videos">← All videos</a> · {duration:.1f}s · {row['size_bytes'] // 1024} KB · {len(clips)} clips</p>
+<div class="card"><h3>Clips</h3>{table}</div>
+<div class="card"><h3>Hand clip — manual range, no AI gate</h3>
+<p class="muted">Khud start/end do — AI judge nahi lagta. Scores sirf jaankari ke liye dikhte hain.</p>
+<form id="hand-form">
+<label>Start (seconds)<input id="hand-start" type="number" min="0" step="0.1" value="0" required></label>
+<label>End (seconds)<input id="hand-end" type="number" min="0" step="0.1" value="30" required></label>
+<label>Hook (optional)<input id="hand-hook" type="text" placeholder="Pehli line — hook"></label>
+<p id="hand-status" class="muted"></p><p id="hand-error" class="err"></p>
+<button class="btn" type="submit">Create hand clip</button></form>
+<p class="muted">Banane ke baad editor khul jayega — wahan se render karo.</p></div>
+<script>
+document.getElementById('hand-form').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const st = document.getElementById('hand-status'), er = document.getElementById('hand-error');
+  er.textContent = ''; st.textContent = 'Hand clip ban raha hai…';
+  const body = {{upload_id: "{upload_id}",
+    start: Number(document.getElementById('hand-start').value),
+    end: Number(document.getElementById('hand-end').value),
+    hook: document.getElementById('hand-hook').value || null}};
+  try {{
+    const r = await fetch('/hand-clip', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+    const j = await r.json();
+    if (!r.ok) {{ er.textContent = 'Error: ' + (j.detail || 'hand clip nahi bana'); st.textContent = ''; return; }}
+    st.textContent = 'Hand clip ban gaya: ' + j.clip_id + ' — editor khul raha hai…';
+    setTimeout(() => location.href = '/app/videos/{upload_id}/clips/' + j.clip_id, 600);
+  }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err; }}
+}});
+</script>
+"""
+    return _app_layout(user, "All videos", body)
+
+
+@app.get("/app/videos/{upload_id}/source")
+def video_source(request: Request, upload_id: str):
+    """Stream the source upload (owner only) — clip preview ke liye."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    row = _get_upload_row(upload_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
+    path = ROOT / row["stored_path"]
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="uploaded file missing on disk")
+    return FileResponse(path, media_type="video/mp4", filename=row["original_name"])
+
+
+@app.get("/app/videos/{upload_id}/clips/{clip_id}", response_class=HTMLResponse)
+def clip_detail(request: Request, upload_id: str, clip_id: str) -> HTMLResponse:
+    """Clip editor page: preview, scores, metadata, trim, re-make, versions."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    if not _get_upload_row(upload_id):
+        return HTMLResponse("<h1>Video not found</h1>", status_code=404)
+    if not _owns_upload(request, upload_id):
+        return RedirectResponse("/login", status_code=303)
+    _, clip = _clip_or_404(upload_id, clip_id)
+    versions = list_render_versions(upload_id, clip_id)
+    error = request.query_params.get("error", "")
+    saved = request.query_params.get("saved", "") == "1"
+    body = _clip_detail_body(user, upload_id, clip, versions,
+                             error=error, saved=saved)
+    return _app_layout(user, "All videos", body)
+
+
+@app.get("/app/videos/{upload_id}/clips/{clip_id}/versions")
+def clip_versions(request: Request, upload_id: str, clip_id: str) -> dict:
+    """All render versions of one clip, as JSON (polling + tests)."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
+    _clip_or_404(upload_id, clip_id)
+    versions = list_render_versions(upload_id, clip_id)
+    return {"upload_id": upload_id, "clip_id": clip_id,
+            "count": len(versions), "versions": versions}
+
+
+@app.post("/app/videos/{upload_id}/clips/{clip_id}/edit")
+async def clip_edit(request: Request, upload_id: str, clip_id: str):
+    """Save edited metadata and/or trim for one clip (no render).
+
+    Accepts a form POST (browser — redirects back to the detail page)
+    or JSON (API — returns the updated clip). Trim is validated
+    against the source video duration; bad trim -> 400, nothing saved.
+    """
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    row = _get_upload_row(upload_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
+    _, clip = _clip_or_404(upload_id, clip_id)
+    body = await _read_body(request)
+    is_json = "application/json" in (request.headers.get("content-type") or "").lower()
+    probe = probe_video(ROOT / row["stored_path"])
+    duration = probe["duration"] if probe["valid"] else 0.0
+    updates: dict = {}
+    for field in ("hook_line", "title", "description", "hashtags"):
+        if field in body and body[field] is not None and str(body[field]) != "":
+            updates[field] = str(body[field])
+    try:
+        start, end = _validate_trim(body.get("start"), body.get("end"),
+                                    duration, float(clip["start"]),
+                                    float(clip["end"]))
+    except (TypeError, ValueError) as exc:
+        detail = str(exc)
+        if is_json:
+            raise HTTPException(status_code=400, detail=detail)
+        return RedirectResponse(
+            f"/app/videos/{upload_id}/clips/{clip_id}?error={detail}",
+            status_code=303)
+    if start != float(clip["start"]) or end != float(clip["end"]):
+        updates["start"], updates["end"] = start, end
+        updates["duration"] = round(end - start, 2)
+    if not updates:
+        if is_json:
+            return {"message": "Kuch badla nahi — koi field nahi di.", "clip": clip}
+        return RedirectResponse(
+            f"/app/videos/{upload_id}/clips/{clip_id}?saved=1", status_code=303)
+    try:
+        updated = update_clip(upload_id, clip_id, updates)
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if is_json:
+        return {"message": "Clip saved.", "clip": updated}
+    return RedirectResponse(
+        f"/app/videos/{upload_id}/clips/{clip_id}?saved=1", status_code=303)
+
+
+@app.post("/remake-clip")
+async def remake_clip_endpoint(request: Request):
+    """Edit (trim/metadata/options) + re-render in one call.
+
+    Body (JSON or form): upload_id, clip_id, start, end, hook_line,
+    title, description, hashtags, caption_style, layout, quality,
+    style_name. Trim is validated first (400, nothing saved); then
+    the clip is updated and rendered in a worker thread. The new
+    render is a NEW version — the old render stays on disk.
+    """
+    body = await _read_body(request)
+    upload_id = str(body.get("upload_id") or "")
+    clip_id = str(body.get("clip_id") or "")
+    if not upload_id or not clip_id:
+        raise HTTPException(status_code=400,
+                            detail="upload_id aur clip_id dono chahiye")
+    row = _get_upload_row(upload_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    video_path = ROOT / row["stored_path"]
+    if not video_path.is_file():
+        raise HTTPException(status_code=404, detail="uploaded file missing on disk")
+    _, clip = _clip_or_404(upload_id, clip_id)
+    try:
+        transcript = load_transcript(upload_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    probe = probe_video(video_path)
+    duration = probe["duration"] if probe["valid"] else 0.0
+    try:
+        start, end = _validate_trim(body.get("start"), body.get("end"),
+                                    duration, float(clip["start"]),
+                                    float(clip["end"]))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    updates: dict = {"start": start, "end": end,
+                     "duration": round(end - start, 2)}
+    for field in ("hook_line", "title", "description", "hashtags"):
+        if field in body and body[field] is not None and str(body[field]) != "":
+            updates[field] = str(body[field])
+    try:
+        stored = dict((load_clips(upload_id).get("options") or {}))
+        opts = parse_options({
+            "caption_style": body.get("caption_style") or stored.get("caption_style"),
+            "layout": body.get("layout") or stored.get("layout"),
+            "quality": body.get("quality") or stored.get("quality"),
+        })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        clip = update_clip(upload_id, clip_id, updates)
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    try:
+        meta = await asyncio.to_thread(
+            render_clip, video_path, upload_id, clip,
+            style_name=str(body.get("style_name") or "global-baatien"),
+            transcript=transcript, options=opts)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"message": f"Re-make ho gaya — version {meta.get('version')}.",
+            **meta}
+
+
+@app.post("/hand-clip")
+async def hand_clip_endpoint(request: Request):
+    """Create a MANUAL clip from [start, end] — no AI gate.
+
+    Body (JSON or form): upload_id, start, end, hook, title,
+    description, hashtags. Range is validated against the source
+    video (400 on a bad range). Returns the created hand_XX clip —
+    render it with POST /render-clip afterwards.
+    """
+    body = await _read_body(request)
+    upload_id = str(body.get("upload_id") or "")
+    if not upload_id:
+        raise HTTPException(status_code=400, detail="upload_id chahiye")
+    row = _get_upload_row(upload_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    video_path = ROOT / row["stored_path"]
+    if not video_path.is_file():
+        raise HTTPException(status_code=404, detail="uploaded file missing on disk")
+    try:
+        transcript = load_transcript(upload_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    probe = probe_video(video_path)
+    duration = probe["duration"] if probe["valid"] else 0.0
+    try:
+        start = float(body.get("start"))
+        end = float(body.get("end"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400, detail="Hand clip ke liye start aur end (seconds) number me do")
+    if start < 0 or end > duration or end <= start or end - start < 5:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Hand clip range galat hai — start >= 0, end <= {duration:.1f}s, "
+                   f"end > start, aur kam se kam 5s ka hona chahiye "
+                   f"(mila: {start}s – {end}s)")
+    try:
+        clip = create_hand_clip(
+            transcript, upload_id, video_path, start, end,
+            hook=body.get("hook"), title=body.get("title"),
+            description=body.get("description"),
+            hashtags=body.get("hashtags"),
+            language=transcript.get("language_requested") or "en")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"message": "Hand clip ban gaya — AI gate nahi lagaya gaya.",
+            **clip}
+
+
+def _render_info_version(clip_id: str, upload_id: str, version: int) -> dict:
+    """Load one exact render version (404 when it does not exist)."""
+    try:
+        return load_render_info(clip_id, upload_id=upload_id, version=version)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/rendered/{upload_id}/{clip_id}/v/{version}")
+def download_version_endpoint(upload_id: str, clip_id: str, version: int):
+    """Download one exact render version (MP4)."""
+    info = _render_info_version(clip_id, upload_id, version)
+    path = Path(info["output_mp4"])
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="rendered file missing on disk")
+    return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+
+@app.get("/rendered/{upload_id}/{clip_id}/v/{version}/srt")
+def download_version_srt_endpoint(upload_id: str, clip_id: str, version: int):
+    """Download one exact render version's SRT captions."""
+    info = _render_info_version(clip_id, upload_id, version)
+    path = Path(info["output_srt"])
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="SRT file missing on disk")
+    return FileResponse(path, media_type="text/plain", filename=path.name)
+
+
+@app.get("/rendered/{upload_id}/{clip_id}/v/{version}/caption")
+def download_version_caption_endpoint(upload_id: str, clip_id: str, version: int):
+    """Download one exact render version's caption .txt (title + caption + hashtags)."""
+    info = _render_info_version(clip_id, upload_id, version)
+    path = Path(info["output_caption_txt"])
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="caption file missing on disk")
+    return FileResponse(path, media_type="text/plain", filename=path.name)
 
 
 @app.get("/app/usage", response_class=HTMLResponse)

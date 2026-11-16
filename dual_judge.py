@@ -49,6 +49,17 @@ SILENCE_FLOOR_DB = -45.0   # bins louder than this count as speech
 BIN_SEC = 1.0
 # dB values at/below this are treated as silence (-inf from ffmpeg).
 MIN_DB = -90.0
+# Phase 5 quiet floor (tunable — see score_loudness): the level
+# factor is RELATIVE to the video's own median, so a video that is
+# half-quiet has a low median and its quiet half scores mid-range
+# (Phase 3: quiet window mean -38.9 dB, median -37.53 dB -> 53/100,
+# passed the 40 gate). A window whose speech mean is quieter than
+# QUIET_MEAN_DB is objectively quiet no matter the median, so its
+# level factor is capped at QUIET_LEVEL_CAP. With the cap, that same
+# quiet window scores ~33 and fails the gate. Loud windows
+# (mean > -38 dB) are untouched.
+QUIET_MEAN_DB = -38.0
+QUIET_LEVEL_CAP = 0.25
 
 _FRAME_RE = re.compile(r"frame:\d+\s+pts:\d+\s+pts_time:([0-9.]+)")
 _RMS_RE = re.compile(r"RMS_level=(-inf|[0-9.+-]+)")
@@ -153,13 +164,25 @@ def _window_bins(curve: dict, start: float, end: float) -> list[dict]:
             and float(b["start"]) + BIN_SEC > start]
 
 
-def score_loudness(start: float, end: float, curve: dict) -> tuple[int, dict]:
+def score_loudness(start: float, end: float, curve: dict,
+                   quiet_db: float | None = None,
+                   quiet_cap: float | None = None) -> tuple[int, dict]:
     """Score one window 0-100 from the loudness curve alone.
 
     Returns (score, breakdown) where breakdown carries the raw
     numbers (mean/peak/median dB, speech fraction) so the reason is
     checkable, not hand-waved.
+
+    quiet_db / quiet_cap (Phase 5 quiet floor, defaults
+    QUIET_MEAN_DB / QUIET_LEVEL_CAP): when the window's speech mean
+    is quieter than quiet_db, level_factor is capped at quiet_cap —
+    the window is objectively quiet, whatever the video median is.
+    Pass quiet_db=None to disable the cap (Phase 3 behaviour).
     """
+    if quiet_db is None:
+        quiet_db = QUIET_MEAN_DB
+    if quiet_cap is None:
+        quiet_cap = QUIET_LEVEL_CAP
     bins = _window_bins(curve, float(start), float(end))
     median_db = curve.get("median_db")
     if not bins or median_db is None:
@@ -180,6 +203,14 @@ def score_loudness(start: float, end: float, curve: dict) -> tuple[int, dict]:
     peak_db = max(b["peak_db"] for b in bins if b["peak_db"] is not None)
     # level factor 0-1: how loud this window is vs the whole video.
     level_factor = max(0.0, min(1.0, (mean_db - median_db + 12.0) / 18.0))
+    # Phase 5 quiet floor: cap the level factor for objectively
+    # quiet windows (mean below quiet_db). The cap is a cliff by
+    # design — below -38 dB mean speech the window is quiet, full
+    # stop — and it is recorded in the breakdown, never hidden.
+    quiet_cap_applied = False
+    if mean_db < quiet_db and level_factor > quiet_cap:
+        level_factor = quiet_cap
+        quiet_cap_applied = True
     # presence 0-30, scaled by level (see docstring: quiet speech
     # must not score ~50 on presence + dynamics alone).
     presence = 30.0 * speech_frac * level_factor
@@ -200,6 +231,9 @@ def score_loudness(start: float, end: float, curve: dict) -> tuple[int, dict]:
         "presence": round(presence, 1), "relative": round(rel, 1),
         "dynamics": round(crest_part + var_part, 1),
         "level_factor": round(level_factor, 2),
+        "quiet_cap_applied": quiet_cap_applied,
+        "quiet_cap_db": quiet_db,
+        "quiet_cap_level": quiet_cap,
     }
 
 
@@ -282,12 +316,16 @@ def score_chat(start: float, end: float, chat_activity,
 
 def reaction_judge(start: float, end: float, curve: dict | None,
                    chat_activity=None,
-                   video_duration: float | None = None) -> dict:
+                   video_duration: float | None = None,
+                   quiet_db: float | None = None,
+                   quiet_cap: float | None = None) -> dict:
     """The Reaction judge: loudness (+ chat when supplied).
 
     Returns {"score", "reason", "breakdown"}.
     curve None -> neutral 50, reason says loudness could not be
     measured (never a fake score).
+    quiet_db / quiet_cap are the Phase 5 quiet floor, passed to
+    score_loudness (defaults there apply when None).
     """
     if curve is None:
         return {"score": 50, "reason": (
@@ -296,22 +334,29 @@ def reaction_judge(start: float, end: float, curve: dict | None,
             "breakdown": {"loudness_score": None, "chat_score": None,
                           "chat_available": False,
                           "note": "no loudness curve — neutral 50"}}
-    loud_score, loud_bd = score_loudness(start, end, curve)
+    loud_score, loud_bd = score_loudness(start, end, curve,
+                                         quiet_db=quiet_db,
+                                         quiet_cap=quiet_cap)
     chat_score, chat_bd = score_chat(start, end, chat_activity, video_duration)
     breakdown = {**loud_bd, **chat_bd}
+    cap_note = ""
+    if loud_bd.get("quiet_cap_applied"):
+        cap_note = (f"; quiet floor cap laga (mean {loud_bd.get('mean_db')} dB < "
+                    f"{loud_bd.get('quiet_cap_db')} dB, level capped at "
+                    f"{loud_bd.get('quiet_cap_level')})")
     if chat_score is None:
         score = loud_score
         reason = (f"Reaction {score}/100 — loudness se (mean "
                   f"{loud_bd.get('mean_db')} dB, video median "
                   f"{loud_bd.get('median_db')} dB, speech "
                   f"{loud_bd.get('speech_fraction', 0) * 100:.0f}%, "
-                  f"crest {loud_bd.get('crest_db')} dB); "
+                  f"crest {loud_bd.get('crest_db')} dB{cap_note}); "
                   f"chat data nahi mila, isliye sirf loudness")
     else:
         score = int(round(0.7 * loud_score + 0.3 * chat_score))
         reason = (f"Reaction {score}/100 — loudness {loud_score} (mean "
                   f"{loud_bd.get('mean_db')} dB vs median "
-                  f"{loud_bd.get('median_db')} dB) + chat {chat_score} "
+                  f"{loud_bd.get('median_db')} dB{cap_note}) + chat {chat_score} "
                   f"({chat_bd.get('chat_messages')} msgs is window me, "
                   f"avg {chat_bd.get('average_rate_per_min')}/min)")
     return {"score": max(0, min(100, score)), "reason": reason,
