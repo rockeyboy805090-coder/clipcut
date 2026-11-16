@@ -1,0 +1,23 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9,<1.0
+python-dotenv>=1.0,<2.0
+opencv-python>=4.10,<5.0
+# Phase 2 — faster-whisper (CTranslate2, NO torch) + Gemini (free API, key optional):
+# Phase 6 fix (15 Nov 2026): openai-whisper + torch needed ~2 GB RAM and
+# CRASHED the Render Free instance (512 MB) on /transcribe. faster-whisper
+# runs the same Whisper models in int8 on CPU (~150 MB model, no torch,
+# no CUDA) — safe on Render Free. Do NOT re-add openai-whisper/torch.
+faster-whisper>=1.0,<2.0
+google-generativeai>=0.8,<1.0
+# V2 (16 Nov 2026) — YouTube download for POST /youtube-job:
+# yt-dlp (pip package ships the `yt-dlp` binary; youtube_job.py falls
+# back to `python -m yt_dlp` if the binary is not on PATH). Free, no key.
+yt-dlp>=2024.8,<2027
+# V2 fix round 2 (15 Nov 2026) — browser impersonation for yt-dlp:
+# curl-cffi lets yt-dlp --impersonate chrome/firefox, which makes its
+# TLS fingerprint look like a real browser (the standard current
+# bypass for YouTube 403s from datacenter IPs). Required by
+# youtube_job.py — without it impersonation silently falls back to
+# plain yt-dlp. Free, no key. Wheels ship prebuilt libcurl.
+curl-cffi>=0.10,<1.0

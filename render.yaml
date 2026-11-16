@@ -1,0 +1,53 @@
+# ClipCut — Render Free web service (NOT deployed yet; Phase 10).
+# Deploy: user creates the GitHub repo in his browser, pushes this
+# folder, connects it in Render, free plan, no card.
+# Env vars to set in the Render dashboard (never commit real keys):
+#   GEMINI_API_KEY=<redacted>  (Phase 2/3 only)
+#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI
+#     (Google sign-in — Phase 1 placeholder, leave unset until ready)
+# NOTE: Render Free = 512 MB RAM, sleeps after 15 min idle, ~1 min cold start.
+# Transcription now uses faster-whisper (CTranslate2, int8, NO torch) —
+# safe on 512 MB. First transcribe downloads the base model (~150 MB)
+# from HuggingFace, then it is cached. Heavy rendering is for local
+# laptop use.
+services:
+  - type: web
+    name: clipcut
+    env: python
+    plan: free
+    # Node 20 (JS runtime for yt-dlp): Render's Python env has no
+    # `node`, and yt-dlp warns that YouTube extraction without a JS
+    # runtime is deprecated / misses formats. The official linux-x64
+    # tarball needs no root/apt — it is extracted into .node/ inside
+    # the project (build output persists to runtime). Free, ~26 MB
+    # download, ~164 MB on disk. youtube_job.py passes the node
+    # binary to yt-dlp by EXPLICIT absolute path
+    # (--js-runtimes node:<path>) — node on PATH alone is NOT
+    # enough (recent yt-dlp enables only deno by default), and the
+    # build VERIFIES `.node/bin/node --version` actually runs:
+    # a stale/broken .node is wiped and re-extracted instead of
+    # silently skipping the install (that is how the round-1 build
+    # could leave yt-dlp without a JS runtime while the deploy
+    # still looked green).
+    buildCommand: |
+      set -e
+      if [ ! -x .node/bin/node ] || ! .node/bin/node --version >/dev/null 2>&1; then
+        rm -rf .node
+        curl -fsSL https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-x64.tar.xz -o /tmp/node-v20.tar.xz
+        mkdir -p .node
+        tar -xJf /tmp/node-v20.tar.xz -C .node --strip-components=1
+        rm -f /tmp/node-v20.tar.xz
+      fi
+      export PATH="$PWD/.node/bin:$PATH"
+      node --version
+      pip install -r requirements.txt
+    # The startCommand logs whether the bundled node is really
+    # there (never fails the start — the `|| echo` guard keeps the
+    # service booting even if .node is missing, so a missing node
+    # is visible in the Render logs instead of silent).
+    startCommand: "( [ -x .node/bin/node ] && .node/bin/node --version || echo 'WARN: bundled node NOT found at .node/bin/node' ) ; PATH=\"$PWD/.node/bin:$PATH\" uvicorn app:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: WHISPER_LANGUAGE
+        value: en
+      - key: WHISPER_MODEL
+        value: base
