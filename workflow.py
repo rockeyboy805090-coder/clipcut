@@ -216,6 +216,15 @@ def get_project_status(upload_id: str, upload_row: dict | None = None) -> dict:
         "size_bytes": upload_row.get("size_bytes"),
         "created_at": upload_row.get("created_at"),
         "status": status,
+        # Phase 9: approval-gate state, explicit — the UI and the
+        # /render-all guard read the same fields, so the button and
+        # the server can never disagree about the lock.
+        "render_all_locked": not bool(approved),
+        "gate_message": ("✅ Render All unlocked — test clip approved: "
+                         + ", ".join(sorted(approved)))
+                        if approved else
+                        ("🔒 Render All locked — pehle 1 test clip approve karo "
+                         "(clip editor me Approve dabao), phir bulk render chalega"),
         "has_transcript": has_transcript,
         "has_clips": has_clips,
         "clips_count": len(clip_ids),

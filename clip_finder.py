@@ -112,14 +112,22 @@ HOOK_WORDS = {
     "kya", "kaise", "kyun", "kyon", "kab", "kahan", "kaun", "kitna", "kitne",
     "क्या", "कैसे", "क्यों", "कब", "कहाँ", "कौन", "कितना", "कितने",
     "کیا", "کیسے", "کیوں", "کب", "کہاں", "کون", "کتنا",
-    "secret", "raaz", "रहस्य", "राज़", "galti", "गलती", "mistake", "paisa",
+    "secret", "raaz", "रहस्य", "राज़", "राज", "galti", "गलती", "गल्ती",
+    "mistake", "paisa",
     "पैसा", "पैसे", "पैसों", "सीक्रेट", "money", "lakh", "लाख", "crore", "करोड़",
-    "ہزار", "हजार", "हज़ार", "free", "muft", "मुफ्त",
-    "پیسے", "پیسہ", "سیکریٹ", "غلطی", "لاکھ", "کروڑ", "سچ", "راز",
-    "pehli", "पहली", "baar", "never", "kabhi", "shock", "shocking", "sach",
+    "हजार", "हज़ार", "free", "muft", "मुफ्त",
+    "पैसे", "पैसा", "سیکریٹ", "غلطی", "لاکھ", "کروڑ", "سچ", "راز",
+    "pehli", "पहली", "पहला", "baar", "never", "kabhi", "shock", "shocking", "sach",
     "सच", "jhooth", "झूठ", "danger", "khatra", "खतरा", "banned", "exposed",
     "reveal", "khulasa", "खुलासा", "stop", "ruko", "रुको", "dekho", "देखो",
     "suno", "सुनो", "warning", "chetawani", "चेतावनी", "viral", "trend",
+    # Phase 9: generic Hindi viral words that real Whisper output uses
+    # (measured 17 Nov 2026 on a Devanagari transcript — the same
+    # content scores 56-65 in English but only 25-35 in Hindi without
+    # these): nukta-less "राज", "बड़ा", "बचत"/"बचाने", "रुपये" variants
+    # (Whisper writes "रुप्ये"), "जानते" (did-you-know), "बतांगा".
+    "बड़ा", "बड़े", "बचत", "बचाने", "रुपये", "रुप्ये", "रुपया", "रुपए",
+    "दूसरा", "तीसरा", "जानते", "बताऊंगा", "बतांगा", "सबसे",
 }
 EMOTION_WORDS = {
     "darr", "डर", "khushi", "खुशी", "gussa", "गुस्सा", "rona", "रोना",
@@ -128,19 +136,25 @@ EMOTION_WORDS = {
     "dard", "दर्द", "sapna", "सपना", "dream", "jeet", "जीत", "haar", "हार",
     "success", "fail", "failure", "struggle", "mehnat", "मेहनत", "kismat",
     "किस्मत", "emotional", "dil", "दिल", "jaan", "जान", "zindagi", "जिंदगी",
+    "जिन्दगी",
     "life", "death", "maut", "मौत", "love", "pyaar", "प्यार", "hate",
+    # Phase 9: "जिन्दगी" (Whisper writes it without chandrabindu),
+    # "बरबाद" (Whisper's spelling of बर्बाद), "टेंशन", "परेशान", "आदत".
+    "बरबाद", "बर्बाद", "टेंशन", "परेशान", "आदत", "खुश",
     "ڈر", "خوشی", "غصہ", "رونا", "ہنسنا", "پاگل", "حیران", "مزہ",
     "درد", "سپنا", "جیت", "ہار", "محنت", "قسمت", "دل", "جان", "زندگی",
     "موت", "پیار",
 }
 CURIOSITY_WORDS = {
-    "raaz", "secret", "pehli baar", "kabhi nahi", "koi nahi janta", "aakhir",
+    "raaz", "राज", "secret", "pehli baar", "kabhi nahi", "koi nahi janta", "aakhir",
     "akhir", "kyun", "kaise", "asli", "real", "truth", "sach", "hidden",
     "chhupa", "छुपा", "wajah", "reason", "kyunki", "agar", "socho", "imagine",
     "kya hoga", "kya hota", "dekhiye", "janiye", "जानिए",
 }
-TEASE_END_WORDS = {"aur", "phir", "lekin", "magar", "aage", "next", "part",
-                   "aage kya", "dekhte", "rukiye", "wait", "aakhir me"}
+TEASE_END_WORDS = {"aur", "और", "phir", "फिर", "lekin", "लेकिन", "magar", "मगर",
+                   "aage", "आगे", "next", "part",
+                   "aage kya", "आगे क्या", "dekhte", "देखते", "rukiye", "रुकिए",
+                   "wait", "aakhir me", "आखिर में", "आखिर"}
 NUMBER_RE = re.compile(r"\d+")
 QUESTION_RE = re.compile(r"[?؟]")
 
@@ -866,6 +880,10 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
             "caption_style": (options or {}).get("caption_style", "bounce"),
             "layout": (options or {}).get("layout", "blurred_fill"),
             "quality": (options or {}).get("quality", "720p"),
+            # Phase 9: the caption language travels with the clips file
+            # — /render-clip defaults to it, so a Hindi project does
+            # not silently re-transcribe back to English at render time.
+            "caption_language": (options or {}).get("caption_language", lang),
             "words_threshold": words_threshold,
             "reaction_threshold": reaction_threshold,
             "dedupe_overlap": dedupe_overlap,

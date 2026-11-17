@@ -164,14 +164,133 @@ def _colour_look(frames) -> dict:
             "mean_std": round(std, 1), "mean_r_minus_b": round(r_avg - b_avg, 1)}
 
 
+def _hsv_to_hex(h: int, s: int = 255, v: int = 255) -> str:
+    """One HSV colour (OpenCV hue 0-179) -> #RRGGBB."""
+    import cv2 as _cv2
+    px = np.uint8([[[h, s, v]]])
+    bgr = _cv2.cvtColor(px, _cv2.COLOR_HSV2BGR)[0][0]
+    b, g, r = int(bgr[0]), int(bgr[1]), int(bgr[2])
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _measure_caption_band(frames) -> dict:
+    """Measure the caption band (lower 50-88% of the frame) of sampled frames.
+
+    Returns white-text fraction, saturated-highlight fraction + the
+    dominant saturated hue as a measured highlight colour, and MSER
+    text-region evidence (count, median text height, median y).
+    This is a MEASUREMENT, not a guess: when no caption-like text is
+    found, caption_readable=False and the caller must not invent a
+    caption style from this video.
+    """
+    out = {"white_frac": 0.0, "sat_frac": 0.0, "highlight_color": None,
+           "highlight_pixels": 0, "mser_regions": 0,
+           "median_text_h_px": None, "median_text_y_pct": None,
+           "caption_readable": False, "frames_measured": 0}
+    if not frames:
+        return out
+    try:
+        mser = cv2.MSER_create()
+        mser.setMinArea(15)
+        mser.setMaxArea(4000)
+    except Exception:
+        mser = None
+    white_total = sat_total = band_total = 0
+    hue_hist: dict[int, int] = {}
+    heights, y_centres = [], []
+    for frame in frames:
+        h, w = frame.shape[:2]
+        y0, y1 = int(h * 0.50), int(h * 0.88)
+        band = frame[y0:y1]
+        if band.size == 0:
+            continue
+        out["frames_measured"] += 1
+        hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+        v_ch, s_ch, h_ch = hsv[:, :, 2], hsv[:, :, 1], hsv[:, :, 0]
+        white_mask = (v_ch > 200) & (s_ch < 90)
+        sat_mask = (v_ch > 170) & (s_ch > 110)
+        band_total += int(band.shape[0] * band.shape[1])
+        white_total += int(np.count_nonzero(white_mask))
+        sat_total += int(np.count_nonzero(sat_mask))
+        if np.count_nonzero(sat_mask):
+            hues = h_ch[sat_mask]
+            # 10 hue bins of 18 (OpenCV hue 0-179).
+            hist, _ = np.histogram(hues, bins=10, range=(0, 180))
+            for i, c in enumerate(hist):
+                hue_hist[i] = hue_hist.get(i, 0) + int(c)
+        if mser is not None:
+            try:
+                gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+                _regions, bboxes = mser.detectRegions(gray)
+                for (x, y, bw, bh) in bboxes:
+                    if bh < 8 or bh > 90:
+                        continue
+                    if bw < 3 or bw > 400:
+                        continue
+                    aspect = bw / max(1, bh)
+                    if aspect < 0.15 or aspect > 6.0:
+                        continue
+                    out["mser_regions"] += 1
+                    heights.append(int(bh))
+                    y_centres.append((y0 + y + bh / 2) / h * 100.0)
+            except Exception:
+                pass
+    if band_total:
+        out["white_frac"] = round(white_total / band_total, 5)
+        out["sat_frac"] = round(sat_total / band_total, 5)
+    out["highlight_pixels"] = sat_total
+    if hue_hist:
+        best_bin = max(hue_hist, key=lambda k: hue_hist[k])
+        if hue_hist[best_bin] >= 20:
+            # Mid hue of the winning bin, full saturation/value.
+            out["highlight_color"] = _hsv_to_hex(best_bin * 18 + 9)
+    if heights:
+        heights.sort()
+        out["median_text_h_px"] = int(heights[len(heights) // 2])
+    if y_centres:
+        y_centres.sort()
+        out["median_text_y_pct"] = round(float(y_centres[len(y_centres) // 2]), 1)
+        # Row concentration: real captions sit on 1-3 text rows, so
+        # most regions cluster near the median y. A busy pattern
+        # (testsrc) scatters regions over the whole band instead.
+        med = out["median_text_y_pct"]
+        near = sum(1 for y in y_centres if abs(y - med) <= 8.0)
+        out["y_cluster_frac"] = round(near / max(1, len(y_centres)), 3)
+    else:
+        out["y_cluster_frac"] = 0.0
+    # Readable = real text-like regions AND bright caption pixels AND
+    # a band that is NOT mostly saturated colour. A plain video (no
+    # captions) has ~0 MSER regions in the band and almost no
+    # bright-white pixels; a captioned clip has both. The saturation
+    # cap is the testsrc guard (verified 17 Nov 2026): a busy test
+    # pattern scores mser=95 + white=0.095 but sat_frac=0.77, while
+    # the real captioned reference scores sat_frac=0.02 — without
+    # the cap the pattern would falsely read as "captioned".
+    # Residual risk (documented): a very busy, saturated real scene
+    # can still false-positive; the strict failure is proven for
+    # caption-less (plain) references, the common case.
+    out["caption_readable"] = bool(
+        out["mser_regions"] >= 3 and out["white_frac"] >= 0.0005
+        and out["sat_frac"] <= 0.40)
+    return out
+
+
 def extract_style(video_path, style_name: str = "Extracted Style",
                   styles_dir: Path | str = "styles",
-                  thumb_dir: Path | str | None = None) -> dict:
+                  thumb_dir: Path | str | None = None,
+                  require_captions: bool = False) -> dict:
     """Extract a style profile from a reference video file.
 
     Returns {"profile": <22-field dict>, "analysis": {...}} and writes
     styles/<slug>.json (exactly the 22 profile fields).
     Raises ValueError if the file is not a valid video.
+    Phase 9: caption colours/size/position are MEASURED from the
+    caption band when readable (see _measure_caption_band); when they
+    are not readable the profile keeps the documented defaults and
+    analysis says caption_colours_measured=False. With
+    require_captions=True (the dashboard flow) an unreadable
+    reference FAILS with "style could not be read" instead of
+    inventing a caption style.
     """
     path = Path(video_path)
     probe = probe_video(path)
@@ -184,6 +303,36 @@ def extract_style(video_path, style_name: str = "Extracted Style",
 
     frames, thumbs = _sample_frames(path, thumb_dir, slug)
     colour = _colour_look(frames)
+    # Phase 9: measure the caption band — real caption colours/size/
+    # position when the reference actually has captions on screen.
+    caption_band = _measure_caption_band(frames)
+    if require_captions and not caption_band["caption_readable"]:
+        raise ValueError(
+            "style could not be read — is reference video me caption text nahi mila "
+            f"(caption band me {caption_band['mser_regions']} text regions, "
+            f"white pixels {caption_band['white_frac']:.4f}). Bina captions wale "
+            "video se caption style nahi padha ja sakta — captions wala reference do.")
+    caption_colours_measured = bool(caption_band["caption_readable"]
+                                    and caption_band["highlight_color"])
+    if caption_colours_measured:
+        highlight_color = str(caption_band["highlight_color"])
+        caption_color = "#FFFFFF"  # bright-white text measured in band
+    else:
+        highlight_color = "#FFFF00"
+        caption_color = "#FFFFFF"
+    frame_h = frames[0].shape[0] if frames else 720
+    if caption_band["median_text_h_px"]:
+        # Text height in the sampled frame, scaled to a 1920-high
+        # render — a rough estimate, recorded as such in analysis.
+        caption_size = max(48, min(120, int(round(
+            caption_band["median_text_h_px"] / max(1, frame_h) * 1920 * 1.1))))
+        caption_size_measured = bool(caption_band["caption_readable"])
+    else:
+        caption_size, caption_size_measured = 80, False
+    caption_y = (caption_band["median_text_y_pct"]
+                 if caption_band["median_text_y_pct"] is not None else 62)
+    if not caption_band["caption_readable"]:
+        caption_y = 62
     scene_changes = _count_scene_changes(path)
     duration = probe["duration"]
     # Cut speed: scene changes per minute -> seconds between cuts.
@@ -207,10 +356,10 @@ def extract_style(video_path, style_name: str = "Extracted Style",
     profile = {
         "style_name": style_name,
         "caption_font": "Montserrat ExtraBold",
-        "caption_size_px": 80,
-        "caption_color": "#FFFFFF",
-        "highlight_color": "#FFFF00",
-        "caption_position_y_percent": 62,
+        "caption_size_px": caption_size,
+        "caption_color": caption_color,
+        "highlight_color": highlight_color,
+        "caption_position_y_percent": caption_y,
         "caption_all_caps": True,
         "outline_px": 3,
         "hook_text_style": hook_text_style,
@@ -249,6 +398,12 @@ def extract_style(video_path, style_name: str = "Extracted Style",
         "ocr_note": "tesseract not installed — hook/CTA text not read, nothing invented"
                     if not ocr_available else "tesseract available — text detection not yet wired in Phase 1",
         "colour_measured": {k: colour[k] for k in ("mean_v", "mean_s", "mean_std", "mean_r_minus_b")},
+        "caption_band": caption_band,
+        "caption_colours_measured": caption_colours_measured,
+        "caption_size_measured": caption_size_measured,
+        "caption_size_note": ("measured from MSER text height, scaled to 1920-high render — estimate"
+                              if caption_size_measured else
+                              "default 80 — caption text not readable in this reference"),
         "style_file": str(out_path),
     }
     return {"profile": profile, "analysis": analysis}

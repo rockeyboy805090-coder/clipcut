@@ -57,6 +57,15 @@ CAPTION_STYLES = {
         "label": "Clean",
         "description": "Quiet, plain captions.",
     },
+    # Phase 9: Custom — NO preset overrides. The style profile's own
+    # caption colours/size/position are used as extracted/measured
+    # (e.g. a reference style's yellow highlight). Without this, the
+    # Bounce/Hype/Clean presets would overwrite every extracted
+    # style's measured caption colours at render time.
+    "custom": {
+        "label": "Custom (reference style)",
+        "description": "Style profile ki captions jaisi hain — no preset override.",
+    },
 }
 
 # --- Frame layouts (teardown §1.3, exact labels) ---
@@ -73,7 +82,30 @@ LAYOUTS = {
         "label": "Fill screen",
         "description": "Zoomed in, so the frame is filled.",
     },
+    # Phase 9: face-tracking crop — the 9:16 crop window FOLLOWS the
+    # speaker's face (re-sampled every second, see face_track.py).
+    # NOT a static centre-crop: the crop x moves with the face. When
+    # no face is found in the clip, it falls back to a centre crop
+    # and says so in the render sidecar — tracking is never claimed
+    # without a detection.
+    "face_track": {
+        "label": "Face tracking",
+        "description": "Crop follows the speaker's face as it moves.",
+    },
 }
+
+# --- Caption languages (Phase 9) ---
+# en = English, hi = Hindi (Devanagari), hinglish = Hinglish (Roman).
+# This is the TRANSCRIPTION language: Whisper decodes in this
+# language, and the ASS/SRT carry exactly what Whisper returned.
+# It is NOT a translator — Hindi audio with "en" will not become
+# clean English, and the mismatch is recorded, never hidden.
+CAPTION_LANGUAGES = {
+    "en": {"label": "English", "note": "English captions (default)."},
+    "hi": {"label": "Hindi", "note": "Hindi captions, Devanagari script."},
+    "hinglish": {"label": "Hinglish", "note": "Hinglish captions, Roman script."},
+}
+CAPTION_LANGUAGE_VALUES = set(CAPTION_LANGUAGES)
 
 # --- Video quality (teardown §1.3) ---
 QUALITIES = {
@@ -93,6 +125,10 @@ DEFAULT_OPTIONS = {
     "video_type": "auto",
     "from_sec": None,
     "to_sec": None,
+    # Phase 9: caption language — the Whisper decoding language for
+    # this job's captions (en default, hi = Devanagari, hinglish =
+    # Roman). Threaded into transcribe + find-clips + render.
+    "caption_language": "en",
     # Phase 3 dual-judge thresholds (CreativeCut rule: clip tabhi jab
     # DONO judge agree karein). Tunable via Options; defaults 50/40.
     "words_threshold": 50,
@@ -226,14 +262,14 @@ def parse_options(raw: dict | None, video_duration: float | None = None) -> dict
         s = str(v).strip().lower()
         if s not in CAPTION_STYLES:
             raise ValueError(
-                f"Caption style galat hai: {v!r} — Bounce, Hype ya Clean me se chuno")
+                f"Caption style galat hai: {v!r} — Bounce, Hype, Clean ya Custom me se chuno")
         opts["caption_style"] = s
     v = pick("layout")
     if v is not None:
         s = str(v).strip().lower()
         if s not in LAYOUTS:
             raise ValueError(
-                f"Layout galat hai: {v!r} — Blurred fill, Zoomed in ya Fill screen me se chuno")
+                f"Layout galat hai: {v!r} — Blurred fill, Zoomed in, Fill screen ya Face tracking me se chuno")
         opts["layout"] = s
     v = pick("quality")
     if v is not None:
@@ -249,6 +285,20 @@ def parse_options(raw: dict | None, video_duration: float | None = None) -> dict
             raise ValueError(
                 f"Video type galat hai: {v!r} — {', '.join(sorted(VIDEO_TYPE_VALUES))} me se chuno")
         opts["video_type"] = s
+    # --- Phase 9: caption language (en / hi / hinglish) ---
+    v = pick("caption_language", "language")
+    if v is not None:
+        s = str(v).strip().lower()
+        if s in ("english",):
+            s = "en"
+        elif s in ("hindi",):
+            s = "hi"
+        elif s in ("hinglish-roman", "roman"):
+            s = "hinglish"
+        if s not in CAPTION_LANGUAGE_VALUES:
+            raise ValueError(
+                f"Caption language galat hai: {v!r} — English, Hindi ya Hinglish me se chuno")
+        opts["caption_language"] = s
 
     # --- From/To window (minutes in the UI, seconds in the API) ---
     from_min = pick("from_min", "from_minute")
@@ -321,6 +371,8 @@ _BUILTIN_PRESETS = {
               "highlight_color": "#FFFFFF", "caption_all_caps": False,
               "outline_px": 2, "caption_position_y_percent": 68,
               "zoom_percent": 100},
+    # Custom: no overrides — the style profile is used as-is.
+    "custom": {},
 }
 
 
@@ -355,6 +407,7 @@ def options_summary(opts: dict) -> dict:
         "layout": o.get("layout", "blurred_fill"),
         "quality": o.get("quality", "720p"),
         "video_type": o.get("video_type", "auto"),
+        "caption_language": o.get("caption_language", "en"),
         "from_sec": o.get("from_sec"),
         "to_sec": o.get("to_sec"),
         "words_threshold": o.get("words_threshold", 50),

@@ -5,6 +5,10 @@
 #   GEMINI_API_KEY=<redacted>  (Phase 2/3 only)
 #   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI
 #     (Google sign-in — Phase 1 placeholder, leave unset until ready)
+#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / YOUTUBE_REDIRECT_URI
+#     (Phase 8 YouTube Shorts posting — same client, separate redirect
+#     URI; also enable YouTube Data API v3 in that Google project.
+#     Leave unset until the user creates the OAuth client.)
 # NOTE: Render Free = 512 MB RAM, sleeps after 15 min idle, ~1 min cold start.
 # Transcription now uses faster-whisper (CTranslate2, int8, NO torch) —
 # safe on 512 MB. First transcribe downloads the base model (~150 MB)

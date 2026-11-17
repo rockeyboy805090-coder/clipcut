@@ -24,6 +24,15 @@ V2 (16 Nov 2026): YouTube link -> fully edited clips, automatically —
   POST /youtube-job + GET /youtube-job/{id} (background worker in
   youtube_job.py: yt-dlp download -> transcribe -> find-clips ->
   render test clip -> approve -> render-all -> project ZIP).
+Phase 9 (17 Nov 2026): upgrades — dashboard file upload (/app/upload,
+  link-free, owner-attached, 100 MB quota), Hindi/Hinglish captions
+  (caption_language en/hi/hinglish threaded transcribe -> find-clips
+  -> render, per-clip re-transcribe), reference-style extractor with
+  MEASURED caption colours + strict "style could not be read" failure,
+  face-tracking crop layout (face_track.py, 1 Hz Haar track,
+  time-varying ffmpeg crop), test-clip approval gate extended
+  (render-all login+ownership, gate state in project status +
+  video/clip pages).
 """
 from __future__ import annotations
 
@@ -38,6 +47,7 @@ import zipfile
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote as _quote
 
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -57,13 +67,15 @@ from auth import (SESSION_COOKIE, STORAGE_QUOTA_BYTES, create_creator,
 
 from style_extractor import (ensure_default_profile, extract_style,
                              list_styles, load_style, save_profile)
-from transcriber import load_transcript, transcribe
+from transcriber import (load_transcript, normalize_language,
+                         normalize_language_strict, transcribe)
 from clip_finder import (create_hand_clip, find_clips, load_clips,
                          update_clip)
 from editor import (find_render_info, list_render_versions,
                     load_render_info, render_clip)
-from options import (CAPTION_STYLES, LAYOUTS, QUALITIES, VIDEO_TYPES,
-                     options_summary, parse_options)
+from options import (CAPTION_LANGUAGES, CAPTION_STYLES, LAYOUTS, QUALITIES, VIDEO_TYPES,
+                     apply_caption_preset, options_summary, parse_options,
+                     render_size)
 from utils import ffmpeg_status, probe_video, slugify
 from workflow import (create_batch, delete_project, get_batch,
                       get_clip_approvals, get_project_status,
@@ -82,6 +94,18 @@ from live_recorder import (check_channel_live, count_live_sessions,
                            reconcile_live_state, register_chunk,
                            session_public, set_live_db_path,
                            start_url_session, stop_live_session)
+from post_queue import (PLATFORMS, cancel_item, delete_youtube_account,
+                        exchange_youtube_code, format_ist, format_ist_input,
+                        get_queue_item, get_valid_access_token,
+                        get_youtube_account, get_youtube_channel,
+                        is_paused_all, list_attempts, list_queue,
+                        parse_ist_datetime_local, pause_item,
+                        post_worker_status, posted_per_day, queue_clip,
+                        queue_counts, reconcile_post_state, resume_item,
+                        retry_item, save_youtube_account, set_pause_all,
+                        set_post_db_path, ensure_post_worker, init_post_tables,
+                        youtube_auth_url, youtube_oauth_configured,
+                        youtube_oauth_missing, consume_oauth_state)
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -111,6 +135,12 @@ async def lifespan(_: FastAPI):
     set_live_db_path(DB_PATH)
     reconcile_live_state(DB_PATH)
     ensure_live_worker()
+    # Phase 8: posting queue tables + the single posting worker thread
+    # (one post at a time — same RAM rule as the live recorder).
+    init_post_tables(DB_PATH)
+    set_post_db_path(DB_PATH)
+    reconcile_post_state(DB_PATH)
+    ensure_post_worker()
     status = ffmpeg_status()
     if status["available"]:
         print(f"[startup] FFmpeg OK: {status['version']}", flush=True)
@@ -119,7 +149,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ClipCut", version="0.12.0-phase7", lifespan=lifespan)
+app = FastAPI(title="ClipCut", version="0.14.0-phase9", lifespan=lifespan)
 
 
 def init_db() -> None:
@@ -162,10 +192,11 @@ def health() -> JSONResponse:
     # --version + one --list-impersonate-targets at first call) —
     # cheap, and they prove on the LIVE instance whether node and
     # browser impersonation are actually available there.
-    return JSONResponse({"status": "ok", "phase": 7, "app": "clipcut-phase7",
+    return JSONResponse({"status": "ok", "phase": 9, "app": "clipcut-phase9",
                          "ffmpeg": ffmpeg_status(),
                          "youtube": youtube_runtime_diagnostics(),
                          "live": live_worker_status(),
+                         "posting": post_worker_status(),
                          "auth": {"google_configured": google_oauth_configured()}})
 
 
@@ -262,6 +293,86 @@ async def upload_videos(
             "storage_quota_deleted": quota_deleted}
 
 
+@app.post("/app/upload")
+async def app_upload_video(
+    request: Request,
+    long_video: UploadFile = File(...),
+    creator_id: str | None = Form(default=None),
+) -> RedirectResponse:
+    """Phase 9 (upgrade 1): dashboard file upload — the link-free path.
+
+    The reference app has NO file upload anywhere; this is the
+    upgrade. Logged-in users only (401 without login), owner-attached,
+    same 100 MB per-user quota as /upload (oldest first), then the
+    SAME pipeline: video page -> transcribe -> find-clips -> editor
+    -> post queue. A single file over the 100 MB quota is rejected
+    (413) instead of silently deleting the user's other videos.
+    """
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    creator = creator_id.strip() if creator_id else None
+    if creator:
+        row = get_creator(DB_PATH, creator)
+        if not row or row["user_id"] != user["id"]:
+            return RedirectResponse("/app?error=creator+not+found", status_code=303)
+    try:
+        saved = await save_upload(long_video, "long video",
+                                  user_id=user["id"], creator_id=creator)
+    except HTTPException as exc:
+        return RedirectResponse(f"/app?error={_quote(str(exc.detail))}",
+                                status_code=303)
+    # 100 MB quota: a file bigger than the whole quota can never fit.
+    if saved["size_bytes"] > STORAGE_QUOTA_BYTES:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute("DELETE FROM uploads WHERE id=?", (saved["id"],))
+            conn.commit()
+        suffix = Path(saved["filename"]).suffix.lower()
+        (UPLOAD_DIR / f"{saved['id']}{suffix}").unlink(missing_ok=True)
+        return RedirectResponse(
+            "/app?error=file+100+MB+quota+se+bada+hai", status_code=303)
+    enforce_storage_quota(DB_PATH, ROOT, user["id"])
+    return RedirectResponse(f"/app/videos/{saved['id']}", status_code=303)
+
+
+@app.post("/app/extract-style")
+async def app_extract_style(
+    request: Request,
+    reference_video: UploadFile = File(...),
+    style_name: str = Form(default="Extracted Style"),
+) -> RedirectResponse:
+    """Phase 9 (upgrade 3): reference-style extractor, dashboard flow.
+
+    Logged-in users only. STRICT caption check: if the reference has
+    no readable caption text, nothing is invented — the user is sent
+    back with "style could not be read". On success the saved preset
+    appears in the styles list and can be picked in the clip editor.
+    """
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    if not reference_video or not reference_video.filename:
+        return RedirectResponse("/app?error=reference+video+file+do",
+                                status_code=303)
+    try:
+        saved = await save_upload(reference_video, "reference video",
+                                  user_id=user["id"])
+        video_path = ROOT / _get_upload_row(saved["id"])["stored_path"]
+        result = extract_style(video_path,
+                               style_name=style_name or "Extracted Style",
+                               styles_dir=STYLES_DIR, thumb_dir=THUMB_DIR,
+                               require_captions=True)
+    except HTTPException as exc:
+        return RedirectResponse(f"/app?error={_quote(str(exc.detail))}",
+                                status_code=303)
+    except ValueError as exc:
+        return RedirectResponse(f"/app?error={_quote(str(exc))}",
+                                status_code=303)
+    from utils import slugify as _slugify
+    slug = _slugify(str(result["profile"].get("style_name", "")))
+    return RedirectResponse(f"/app?extracted={slug}", status_code=303)
+
+
 @app.post("/extract-style")
 async def extract_style_endpoint(
     reference_video: UploadFile | None = File(default=None),
@@ -329,6 +440,8 @@ async def transcribe_endpoint(
     model: str | None = Form(default=None),
     initial_prompt: str | None = Form(default=None),
     language: str = Form(default="en"),
+    # Phase 9 alias: the Options panel sends caption_language.
+    caption_language: str | None = Form(default=None),
 ) -> dict:
     """Transcribe an uploaded long video with local Whisper.
 
@@ -345,6 +458,14 @@ async def transcribe_endpoint(
     if not video_path.is_file():
         raise HTTPException(status_code=404, detail="uploaded file missing on disk")
     try:
+        # Phase 9: unknown caption_language is a 400 here, not a
+        # silent English fallback (see normalize_language_strict).
+        eff_language = (normalize_language_strict(caption_language)
+                        if caption_language else
+                        normalize_language(language or "en"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
         # CPU work runs in a worker thread (Phase 6 fix, 15 Nov 2026):
         # a sync transcribe inside this async endpoint blocked the
         # event loop for minutes — /health hung and Render's proxy
@@ -353,7 +474,7 @@ async def transcribe_endpoint(
         result = await asyncio.to_thread(
             transcribe, video_path, upload_id, model_name=model or None,
             initial_prompt=initial_prompt or None,
-            language=language or "en")
+            language=eff_language)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
@@ -362,6 +483,7 @@ async def transcribe_endpoint(
         "message": "Transcript ready.",
         "upload_id": upload_id,
         "model": result["model"],
+        "model_note": result.get("model_note", ""),
         "language": result["language"],
         "language_requested": result.get("language_requested", "en"),
         "language_note": result.get("language_note", ""),
@@ -399,6 +521,10 @@ async def find_clips_endpoint(
     layout: str | None = Form(default=None),
     quality: str | None = Form(default=None),
     video_type: str | None = Form(default=None),
+    # Phase 9: caption language (en / hi / hinglish) — the Whisper
+    # decoding language for this job. caption_language wins over the
+    # legacy `language` field when both are sent.
+    caption_language: str | None = Form(default=None),
     # Phase 3 dual-judge thresholds (defaults 50/40 — see options.py).
     words_threshold: str | None = Form(default=None),
     reaction_threshold: str | None = Form(default=None),
@@ -412,6 +538,9 @@ async def find_clips_endpoint(
     Phase 2: the Options panel (count / length / From-To / type /
     caption style / layout / quality) is validated here and recorded
     on the clips file, so /render-clip can default to it later.
+    Phase 9: caption_language (en/hi/hinglish) is the transcription
+    language — the ASS/SRT carry exactly what Whisper returned in
+    that language; nothing is translated.
     """
     row = _get_upload_row(upload_id)
     if not row:
@@ -425,11 +554,20 @@ async def find_clips_endpoint(
     except Exception:
         duration = None
     try:
+        # Phase 9: unknown caption_language is a 400 here, not a
+        # silent English fallback (see normalize_language_strict).
+        eff_language = (normalize_language_strict(caption_language)
+                        if caption_language else
+                        normalize_language(language or "en"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
         opts = parse_options({
             "clip_count": top_n, "min_sec": min_sec, "max_sec": max_sec,
             "from_min": from_min, "to_min": to_min,
             "caption_style": caption_style, "layout": layout,
             "quality": quality, "video_type": video_type,
+            "caption_language": eff_language,
             "words_threshold": words_threshold,
             "reaction_threshold": reaction_threshold,
         }, video_duration=duration)
@@ -442,7 +580,7 @@ async def find_clips_endpoint(
             # Same worker-thread rule as /transcribe (see above).
             transcript = await asyncio.to_thread(
                 transcribe, video_path, upload_id,
-                language=language or "en")
+                language=eff_language)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         except ValueError as exc:
@@ -451,6 +589,22 @@ async def find_clips_endpoint(
         raise HTTPException(
             status_code=400,
             detail="Transcript khaali hai — video me boli hui baat nahi mili, clips nahi ban sakte")
+    # Phase 9: an existing transcript in ANOTHER language does not
+    # satisfy this request — re-transcribe in the chosen language so
+    # the captions really follow the choice (Whisper decoding, never
+    # a silent translation of the old transcript).
+    if transcript.get("language_requested") != eff_language:
+        try:
+            transcript = await asyncio.to_thread(
+                transcribe, video_path, upload_id, language=eff_language)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not transcript.get("words"):
+            raise HTTPException(
+                status_code=400,
+                detail="Transcript khaali hai — video me boli hui baat nahi mili, clips nahi ban sakte")
     # Phase 6: the logged-in user's BYOK config drives the words
     # judge (their provider/model/key); anonymous calls keep the
     # legacy env-key behaviour. Ledger rows are written per user.
@@ -466,7 +620,7 @@ async def find_clips_endpoint(
     # measure loudness (without it the reaction score is neutral 50).
     result = find_clips(transcript, upload_id, top_n=opts["clip_count"],
                         style_name=style_name, options=opts,
-                        language=language or transcript.get("language_requested") or "en",
+                        language=eff_language,
                         video_path=video_path, ai_config=ai_config,
                         ledger_ctx=ledger_ctx)
     return {"message": "Clips ready.", "options": options_summary(opts), **result}
@@ -480,6 +634,28 @@ def get_clips_endpoint(upload_id: str) -> dict:
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+async def _ensure_transcript_language(video_path, upload_id: str,
+                                      transcript: dict,
+                                      caption_language: str | None) -> tuple[dict, bool]:
+    """Phase 9 (per-clip language): if the requested caption language
+    differs from the transcript's language, re-transcribe in the
+    requested language (Whisper decoding) and return the fresh
+    transcript + True. Otherwise return the transcript unchanged +
+    False. Never "translates" an old transcript — the words always
+    come from Whisper hearing the audio in that language.
+    """
+    wanted = normalize_language(caption_language) if caption_language else None
+    if not wanted or transcript.get("language_requested") == wanted:
+        return transcript, False
+    fresh = await asyncio.to_thread(transcribe, video_path, upload_id,
+                                    language=wanted)
+    if not fresh.get("words"):
+        raise HTTPException(
+            status_code=400,
+            detail="Transcript khaali hai — is language me boli hui baat nahi mili")
+    return fresh, True
+
+
 @app.post("/render-clip")
 async def render_clip_endpoint(
     request: Request,
@@ -491,6 +667,9 @@ async def render_clip_endpoint(
     caption_style: str | None = Form(default=None),
     layout: str | None = Form(default=None),
     quality: str | None = Form(default=None),
+    # Phase 9: per-clip caption language — a different language than
+    # the stored transcript re-transcribes first (see helper above).
+    caption_language: str | None = Form(default=None),
 ) -> dict:
     """Render ONE clip to 9:16 with captions + grading.
 
@@ -534,9 +713,23 @@ async def render_clip_endpoint(
             "caption_style": caption_style or stored.get("caption_style"),
             "layout": layout or stored.get("layout"),
             "quality": quality or stored.get("quality"),
+            "caption_language": (caption_language
+                                 or stored.get("caption_language")
+                                 # Phase 9 fallback: a clips file written
+                                 # before caption_language existed (or by
+                                 # an older call) must not flip the
+                                 # project back to English — the stored
+                                 # transcript's language is the truth.
+                                 or transcript.get("language_requested")),
         })
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Phase 9: per-clip language switch — re-transcribe if needed.
+    try:
+        transcript, _retrans = await _ensure_transcript_language(
+            video_path, upload_id, transcript, opts.get("caption_language"))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     try:
         # Worker thread, same reason as /transcribe (see above) —
         # a ~47s clip takes 1-3 min on CPU.
@@ -548,7 +741,8 @@ async def render_clip_endpoint(
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return {"message": "Clip rendered.", **meta}
+    return {"message": "Clip rendered.",
+            "retranscribed_for_language": _retrans, **meta}
 
 
 def _render_info(clip_id: str, upload_id: str | None = None) -> dict:
@@ -804,13 +998,23 @@ def delete_project_endpoint(upload_id: str) -> dict:
 
 @app.post("/approve-clip")
 async def approve_clip_endpoint(
+    request: Request,
     upload_id: str = Form(...),
     clip_id: str = Form(...),
 ) -> dict:
-    """Approve ONE test clip. This unlocks POST /render-all."""
+    """Approve ONE test clip. This unlocks POST /render-all.
+
+    Phase 9: login + ownership required (an approval is what unlocks
+    bulk rendering, so it must come from the video's owner).
+    """
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
     row = _get_upload_row(upload_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
     try:
         clips_data = load_clips(upload_id)
     except FileNotFoundError as exc:
@@ -824,14 +1028,23 @@ async def approve_clip_endpoint(
 
 @app.post("/reject-clip")
 async def reject_clip_endpoint(
+    request: Request,
     upload_id: str = Form(...),
     clip_id: str = Form(...),
     reason: str = Form(default=""),
 ) -> dict:
-    """Reject a clip (it stays in the list, marked rejected)."""
+    """Reject a clip (it stays in the list, marked rejected).
+
+    Phase 9: login + ownership required, same rule as approve.
+    """
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
     row = _get_upload_row(upload_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
     try:
         clips_data = load_clips(upload_id)
     except FileNotFoundError as exc:
@@ -844,12 +1057,15 @@ async def reject_clip_endpoint(
 
 @app.post("/render-all")
 async def render_all_endpoint(
+    request: Request,
     upload_id: str = Form(...),
     style_name: str = Form(default="global-baatien"),
     # Phase 2: same render-time Options as /render-clip.
     caption_style: str | None = Form(default=None),
     layout: str | None = Form(default=None),
     quality: str | None = Form(default=None),
+    # Phase 9: per-job caption language (re-transcribes once if needed).
+    caption_language: str | None = Form(default=None),
 ) -> dict:
     """Render ALL clips of an upload, sequentially.
 
@@ -859,10 +1075,18 @@ async def render_all_endpoint(
     upload_id matches) are skipped, not re-rendered. Each clip runs
     in a worker thread — 1-3 min on CPU per clip, so a 4-clip video
     takes ~8 min; /health stays responsive throughout.
+    Phase 9: login + ownership required (the guard used to be
+    enforceable by anyone — an unauthenticated call could render a
+    whole project once somebody else had approved a clip).
     """
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
     row = _get_upload_row(upload_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
     if not has_approved_clip(upload_id):
         raise HTTPException(
             status_code=400,
@@ -884,9 +1108,21 @@ async def render_all_endpoint(
             "caption_style": caption_style or stored.get("caption_style"),
             "layout": layout or stored.get("layout"),
             "quality": quality or stored.get("quality"),
+            "caption_language": (caption_language
+                                 or stored.get("caption_language")
+                                 # Phase 9 fallback: see /render-clip —
+                                 # the stored transcript's language wins
+                                 # over the English default.
+                                 or transcript.get("language_requested")),
         })
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Phase 9: one re-transcribe for the whole job if the language changed.
+    try:
+        transcript, _retrans = await _ensure_transcript_language(
+            video_path, upload_id, transcript, opts.get("caption_language"))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     results: list[dict] = []
     approvals = get_clip_approvals(upload_id)
     for clip in clips_data.get("clips", []):
@@ -920,7 +1156,10 @@ async def render_all_endpoint(
     rejected_n = sum(1 for r in results if r["status"] == "skipped_rejected")
     error_n = sum(1 for r in results if r["status"] == "error")
     return {"message": f"Render-all done: {rendered_n} rendered, {skipped_n} skipped (pehle se rendered), {rejected_n} skipped (rejected), {error_n} error.",
-            "upload_id": upload_id, "results": results,
+            "upload_id": upload_id,
+            "retranscribed_for_language": _retrans,
+            "gate": get_project_status(upload_id).get("gate_message", ""),
+            "results": results,
             "project": get_project_status(upload_id)}
 
 
@@ -949,7 +1188,9 @@ async def create_batch_endpoint(
             raise HTTPException(status_code=404, detail=f"upload not found: {uid}")
     batch = create_batch([str(u) for u in upload_ids],
                          style_name=str(payload.get("style_name") or ""),
-                         language=str(payload.get("language") or "en"))
+                         language=normalize_language(
+                             str(payload.get("caption_language")
+                                 or payload.get("language") or "en")))
     background_tasks.add_task(run_batch, batch["batch_id"])
     return {"message": "Batch queued — transcribe + find-clips background me chal raha hai. GET /batch/{batch_id} se progress dekho.",
             "batch_id": batch["batch_id"], "total": len(upload_ids),
@@ -1068,6 +1309,7 @@ def _app_layout(user: dict, active: str, body: str) -> HTMLResponse:
             + creator_links
             + nav("/app", "＋ New creator", "New creator")
             + nav("/app/usage", "AI usage", "AI usage")
+            + nav("/app/post-queue", "Post queue", "Post queue")
             + nav("/app/notifications", "Notifications", "Notifications")
             + nav("/app/settings/profile", "Settings", "Settings")
             + "<a href=\"/logout\">Sign out</a></nav>"
@@ -1139,14 +1381,28 @@ def _dashboard_data(user: dict) -> dict:
             (user["id"],)).fetchone()[0]
     clips = _clips_files_for_user(user["id"])
     clips_today = sum(1 for c in clips if c["date"] == today)
+    # Phase 8: real posting counts (was hardcoded 0).
+    try:
+        _qc = queue_counts(DB_PATH, user["id"])
+        _posted_days = posted_per_day(DB_PATH, user["id"], days=14)
+        posted_today = _qc["posted_today"]
+        waiting_to_post = _qc["waiting"]
+        posted_total = _qc["posted_total"]
+    except Exception:
+        _posted_days, posted_today = {}, 0
+        waiting_to_post, posted_total = 0, 0
     activity = []
     for i in range(13, -1, -1):
         day = today - _td(days=i)
         n = sum(1 for c in clips if c["date"] == day)
-        activity.append({"day": day.strftime("%b %d"), "clips": n, "posted": 0})
+        activity.append({"day": day.strftime("%b %d"), "clips": n,
+                         "posted": _posted_days.get(day.isoformat(), 0)})
     return {"videos_today": videos_today, "videos_total": videos_total,
             "clips_today": clips_today, "clips_total": len(clips),
             "activity": activity,
+            "posted_today": posted_today,
+            "waiting_to_post": waiting_to_post,
+            "posted_total": posted_total,
             # Phase 7: real live-session counts (was hardcoded 0).
             "recording_now": count_live_sessions(DB_PATH, user["id"]),
             "live_sessions": [session_public(DB_PATH, s) for s in
@@ -1321,6 +1577,44 @@ def dashboard(request: Request) -> HTMLResponse:
                          "streamer their own workspace.</p>")
     step1 = "✅" if creators else "1"
     step2 = "✅" if data["videos_total"] else "2"
+    # Phase 8: step 3 is done when a YouTube posting account is connected.
+    try:
+        step3 = "✅" if get_youtube_account(DB_PATH, user["id"]) else "3"
+    except Exception:
+        step3 = "3"
+    # Phase 8: real post-queue card (was a hardcoded empty state).
+    try:
+        _pq = queue_counts(DB_PATH, user["id"])
+        _paused_all = is_paused_all(DB_PATH, user["id"])
+        _queued_items = list_queue(DB_PATH, user["id"], status="queued")
+        _next_due = _queued_items[0] if _queued_items else None
+    except Exception:
+        _pq = {"waiting": 0, "posted_total": 0, "failed": 0}
+        _paused_all, _next_due = False, None
+    if _pq["waiting"] or _pq["posted_total"] or _pq["failed"]:
+        _next_line = (f"<p class=\"muted\">Next: <b>{_html.escape(_next_due['title'])}</b> "
+                      f"→ {PLATFORMS[_next_due['platform']]['label']} · "
+                      f"{format_ist(_next_due['scheduled_at'])}</p>"
+                      if _next_due else "")
+        _pause_line = ("<p class=\"muted\">⏸ Paused — worker kuch post nahi "
+                       "karega jab tak Resume na dabao.</p>" if _paused_all
+                       else "<p class=\"muted\">▶ Posting on — due items apne "
+                       "time par post honge.</p>")
+        pq_card = (f"<div class=\"card\"><h3>Post queue</h3>"
+                   f"<p class=\"muted\">{_pq['waiting']} waiting to post · "
+                   f"{_pq['posted_total']} posted · {_pq['failed']} failed</p>"
+                   f"{_next_line}{_pause_line}"
+                   f"<form method=\"post\" action=\"/app/post-queue/pause-all\" "
+                   f"style=\"display:inline\">"
+                   f"<button class=\"btn ghost\" type=\"submit\">"
+                   f"{'Resume all posting' if _paused_all else 'Pause all posting'}"
+                   f"</button></form> "
+                   f"<a class=\"btn ghost\" href=\"/app/post-queue\">Open post queue</a></div>")
+    else:
+        pq_card = ("<div class=\"card\"><h3>Post queue</h3>"
+                   "<p class=\"muted\">Queued clips go out at their scheduled time.</p>"
+                   "<p class=\"muted\">Nothing queued or posted yet.</p>"
+                   "<a class=\"btn ghost\" href=\"/app/post-queue\">Open post queue</a></div>")
     type_options = "".join(
         f'<option value="{v}">{label}</option>' for v, label in VIDEO_TYPES)
     caption_radios = "".join(
@@ -1338,6 +1632,37 @@ def dashboard(request: Request) -> HTMLResponse:
         f'{" checked" if k == "720p" else ""}> {v["label"]}'
         f' <span class="muted">— {v["note"]}</span></label>'
         for k, v in QUALITIES.items())
+    # Phase 9: caption language radios (en / hi / hinglish) — the
+    # Whisper decoding language for this job's captions.
+    lang_radios = "".join(
+        f'<label><input type="radio" name="opt-lang" value="{k}"'
+        f'{" checked" if k == "en" else ""}> {v["label"]}'
+        f' <span class="muted">— {v["note"]}</span></label>'
+        for k, v in CAPTION_LANGUAGES.items())
+    # Phase 9: saved styles for the reference-style card.
+    try:
+        _styles = list_styles(STYLES_DIR)
+    except Exception:
+        _styles = []
+    if _styles:
+        styles_html = ("<p>" + " · ".join(
+            f"<b>{_html.escape(s['name'])}</b> "
+            f"<span class=\"muted\">({s['slug']})</span>" for s in _styles)
+            + "</p><p class=\"muted\">Clip editor me Re-make karte waqt "
+              "inme se koi style choose karo.</p>")
+    else:
+        styles_html = ("<p class=\"muted\">Abhi sirf default Global Baatien "
+                       "style hai — upar se reference video do.</p>")
+    # Phase 9: banners for upload / style-extract redirects.
+    _err = request.query_params.get("error", "")
+    _extracted = request.query_params.get("extracted", "")
+    if _err:
+        _banner = f'<p class="err">Error: {_html.escape(_err)}</p>'
+    elif _extracted:
+        _banner = (f'<p style="color:#4ade80">Style saved ✓ — '
+                   f'{_html.escape(_extracted)} (clip editor me choose karo)</p>')
+    else:
+        _banner = ""
     # Phase 7: live sessions card (real counts, not hardcoded 0).
     if data["live_sessions"]:
         live_rows = "".join(
@@ -1357,9 +1682,10 @@ def dashboard(request: Request) -> HTMLResponse:
                      "<a class=\"btn ghost\" href=\"/app/live\">All live sessions</a></div>")
     body = f"""
 <h1>Home</h1>
+{_banner}
 <p class="muted">Good afternoon. {len(creators)} creator{'s' if len(creators) != 1 else ''}.</p>
 <div class="card"><h3>What do you want to clip today?</h3>
-<p class="muted">Paste a link to a video. You get captioned shorts back.</p>
+<p class="muted">Paste a link to a video — ya neeche se file upload karo. You get captioned shorts back.</p>
 <form id="yt-form"><label>Video link
 <input id="yt-url" type="url" placeholder="Paste a YouTube, Twitch or Kick video link" required></label>
 <div style="display:flex;gap:10px"><label style="flex:1">File under creator
@@ -1378,6 +1704,7 @@ def dashboard(request: Request) -> HTMLResponse:
 <div class="radio"><label style="display:block">Caption style</label>{caption_radios}</div>
 <div class="radio"><label style="display:block">What should the frame look like?</label>{layout_radios}</div>
 <div class="radio"><label style="display:block">Video quality</label>{quality_radios}</div>
+<div class="radio"><label style="display:block">Caption language — captions kis bhasha me hon?</label>{lang_radios}</div>
 <div class="optrow"><div><label>Only look at part of the video — From (minute)
 <input id="opt-from" type="number" min="0" step="0.5" placeholder="Up to minute"></label></div>
 <div><label>To (minute)
@@ -1386,14 +1713,29 @@ def dashboard(request: Request) -> HTMLResponse:
 <p id="yt-error" class="err"></p>
 <button class="btn" type="submit">Make clips</button></form>
 <p id="yt-status" class="muted"></p></div>
+<div class="card"><h3>Or upload a file — link ki zaroorat nahi</h3>
+<p class="muted">Reference app me file upload hai hi nahi — yahan hai. Apni video upload karo, wahi pipeline chalega: transcribe → find-clips → editor → post queue. 100 MB quota (per user, sabse purani video pehle delete hoti hai).</p>
+<form method="post" action="/app/upload" enctype="multipart/form-data">
+<label>Video file (MP4 / MOV)<input type="file" name="long_video" accept=".mp4,.mov" required></label>
+<div style="display:flex;gap:10px"><label style="flex:1">File under creator
+<select name="creator_id"><option value="">No creator</option>{creator_options}</select></label></div>
+<button class="btn" type="submit">Upload &amp; open video</button></form>
+<p class="muted">Upload ke baad video page khulega — wahan transcribe + find-clips karo (caption language wahi choose karo).</p></div>
+<div class="card"><h3>Reference style — kisi video ki editing style copy karo</h3>
+<p class="muted">Captions wali reference video do — uski caption colours, size aur position measure karke saved style banti hai. Bina captions wale video par "style could not be read" milega — koi invented style nahi banegi.</p>
+<form method="post" action="/app/extract-style" enctype="multipart/form-data">
+<label>Reference video (MP4 / MOV)<input type="file" name="reference_video" accept=".mp4,.mov" required></label>
+<label>Style name<input name="style_name" type="text" placeholder="e.g. My Podcast Style" value="Extracted Style"></label>
+<button class="btn" type="submit">Extract style</button></form>
+<p class="muted">Saved styles:</p>{styles_html}</div>
 <div class="tiles">
 <div class="tile"><b>{data['recording_now']}</b><span>Recording now</span></div>
 <div class="tile"><b>{data['clips_today']}</b><span>Clips today</span></div>
-<div class="tile"><b>0</b><span>Posted today</span></div>
-<div class="tile"><b>0</b><span>Waiting to post</span></div></div>
+<div class="tile"><b>{data['posted_today']}</b><span>Posted today</span></div>
+<div class="tile"><b>{data['waiting_to_post']}</b><span>Waiting to post</span></div></div>
 {live_card}
 <div class="card"><h3>Activity — Last 14 days</h3>
-<p class="muted">{data['clips_total']} Clips made · 0 Posted · 0 Views · $0.00 Est. earnings</p>
+<p class="muted">{data['clips_total']} Clips made · {data['posted_total']} Posted · 0 Views · $0.00 Est. earnings</p>
 <div class="bar-row">{bars}</div>
 <div style="display:flex;gap:6px">{labels}</div>
 <p class="muted">Pink = Clips made · White = Posted</p></div>
@@ -1405,17 +1747,14 @@ def dashboard(request: Request) -> HTMLResponse:
 <div class="card"><h3>Next steps — Finish setting up ClipCut</h3>
 <p>{step1} Add your first creator — Give each streamer their own workspace, settings and folder.</p>
 <p>{step2} Make your first clips — Paste a video link in the box above.</p>
-<p>3 Connect a posting account — YouTube, Instagram or TikTok, in one click. (Phase 8)</p></div>
+<p>{step3} Connect a posting account — YouTube, Instagram or TikTok, in one click. (<a href="/app/settings/apps">Connected apps</a>)</p></div>
 <div class="card"><h3>Creators — Each creator's status and results</h3>{creators_html}
 <form method="post" action="/app/creators"><h3 style="margin-top:16px">Add a creator</h3>
 <p class="muted">ClipCut can record this streamer live and keep the clips organised by them. (Live recording — Phase 7)</p>
 <label>Channel link<input name="channel_link" type="url" placeholder="https://www.youtube.com/@name, twitch.tv/name or kick.com/name" required></label>
 <label>Name<input name="name" type="text" placeholder="Filled in from the channel, or type one."></label>
 <button class="btn" type="submit">Create workspace</button></form></div>
-<div class="card"><h3>Post queue</h3>
-<p class="muted">Queued clips go out at their scheduled time.</p>
-<p class="muted">Nothing queued or posted yet.</p>
-<button class="btn ghost" type="button" onclick="alert('Nothing queued — Pause all posting needs a queue first (Phase 8).')">Pause all posting</button></div>
+{pq_card}
 <script>
 document.querySelectorAll('[data-live-check]').forEach((btn) => {{
   btn.addEventListener('click', async () => {{
@@ -1454,12 +1793,13 @@ document.getElementById('yt-form').addEventListener('submit', async (e) => {{
     caption_style: radio('opt-caption') || 'bounce',
     layout: radio('opt-layout') || 'blurred_fill',
     quality: radio('opt-quality') || '720p',
+    caption_language: radio('opt-lang') || 'en',
     video_type: val('yt-type') || 'auto',
     from_min: fromMin, to_min: toMin,
   }};
   st.textContent = 'Job start ho raha hai…';
   try {{
-    const r = await fetch('/youtube-job', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{url, language:'en', creator_id: val('yt-creator') || null, options}})}});
+    const r = await fetch('/youtube-job', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{url, language: radio('opt-lang') || 'en', creator_id: val('yt-creator') || null, options}})}});
     const j = await r.json();
     if (!r.ok) {{ er.textContent = 'Error: ' + (j.detail || 'job start nahi hua'); st.textContent = ''; return; }}
     st.textContent = 'Job queued: ' + j.job_id + ' — status dekhne ke liye /youtube-job/' + j.job_id + ' kholo.';
@@ -1606,7 +1946,7 @@ def _fmt_score(v) -> str:
 
 def _clip_detail_body(user: dict, upload_id: str, clip: dict,
                       versions: list[dict], error: str = "",
-                      saved: bool = False) -> str:
+                      saved: bool = False, gate_unlocked: bool = False) -> str:
     """HTML body for the clip detail page (score + judges + editor)."""
     esc = _html.escape
     row = _get_upload_row(upload_id)
@@ -1626,7 +1966,12 @@ def _clip_detail_body(user: dict, upload_id: str, clip: dict,
     if latest:
         preview = (f'<video controls src="/rendered/{upload_id}/{clip["clip_id"]}">'
                    f'</video><p class="muted">Latest render — v{latest.get("version", 1)} '
-                   f'({latest.get("resolution", "?")}, {latest.get("duration_sec", "?")}s)</p>')
+                   f'({latest.get("resolution", "?")}, {latest.get("duration_sec", "?")}s)</p>'
+                   + (f'<p class="muted">{esc(str(latest.get("language_note", "")))}</p>'
+                      if latest.get("language_note") else "")
+                   + (f'<p class="muted">Layout: {esc(str(latest.get("layout", "?")))} — '
+                      f'{esc(str(latest.get("layout_note", "")))}</p>'
+                      if latest.get("layout_note") else ""))
     else:
         preview = (f'<video controls preload="metadata" '
                    f'src="/app/videos/{upload_id}/source#t={clip["start"]},{clip["end"]}">'
@@ -1663,6 +2008,63 @@ def _clip_detail_body(user: dict, upload_id: str, clip: dict,
     qual_opts = "".join(
         f'<option value="{k}"{" selected" if k == (latest or {}).get("quality", "720p") else ""}>{v["label"]}</option>'
         for k, v in QUALITIES.items())
+    # Phase 9: style preset picker (saved reference styles) + per-clip
+    # caption language. Face tracking appears in the layout dropdown
+    # automatically (LAYOUTS gained "face_track" in options.py).
+    try:
+        _saved_styles = list_styles(STYLES_DIR)
+    except Exception:
+        _saved_styles = []
+    style_opts = "".join(
+        f'<option value="{s["slug"]}"{" selected" if s["slug"] == (latest or {}).get("style_slug", "global-baatien") else ""}>{esc(s["name"])}</option>'
+        for s in _saved_styles) or '<option value="global-baatien">Global Baatien Style</option>'
+    lang_opts = "".join(
+        f'<option value="{k}"{" selected" if k == (latest or {}).get("language_requested", "en") else ""}>{v["label"]}</option>'
+        for k, v in CAPTION_LANGUAGES.items())
+    # Phase 8: queue-for-posting card (needs a render first — the
+    # worker uploads the actual rendered MP4, never a placeholder).
+    from datetime import datetime as _dt8, timedelta as _td8, timezone as _tz8
+    _default_sched = format_ist_input(
+        (_dt8.now(_tz8.utc) + _td8(hours=1)).isoformat())
+    if latest:
+        _dur = latest.get("duration_sec")
+        _shorts_warn = ""
+        try:
+            if _dur is not None and float(_dur) > 60:
+                _shorts_warn = (f"<p class=\"err\">⚠️ Yeh render {_dur}s ka hai — "
+                                "YouTube Shorts 60s se kam ka hota hai. 60s+ wala "
+                                "video Shorts nahi, normal video ki tarah post hoga.</p>")
+        except (TypeError, ValueError):
+            pass
+        queue_card = (f"<div class=\"card\"><h3>Queue for posting</h3>"
+                      f"{_shorts_warn}"
+                      f"<form method=\"post\" action=\"/app/post-queue\">"
+                      f"<input type=\"hidden\" name=\"upload_id\" value=\"{upload_id}\">"
+                      f"<input type=\"hidden\" name=\"clip_id\" value=\"{clip['clip_id']}\">"
+                      f"<input type=\"hidden\" name=\"version\" value=\"{latest.get('version', 1)}\">"
+                      f"<label>Platform<select name=\"platform\">"
+                      f"<option value=\"youtube\">YouTube Shorts</option>"
+                      f"<option value=\"instagram\">Instagram Reels (not set up)</option>"
+                      f"<option value=\"tiktok\">TikTok (not set up)</option></select></label>"
+                      f"<label>Title<input name=\"title\" maxlength=\"100\" value=\"{esc(str(clip.get('title') or clip.get('hook_line') or ''))}\"></label>"
+                      f"<label>Description<textarea name=\"description\" rows=\"3\">{esc(str(clip.get('description') or ''))}</textarea></label>"
+                      f"<label>Hashtags<input name=\"hashtags\" value=\"{esc(str(clip.get('hashtags') or ''))}\"></label>"
+                      f"<label>Privacy<select name=\"privacy\">"
+                      f"<option value=\"unlisted\" selected>Unlisted (safe default)</option>"
+                      f"<option value=\"public\">Public</option>"
+                      f"<option value=\"private\">Private</option></select></label>"
+                      f"<label>Post at (Asia/Kolkata)<input name=\"scheduled_at\" type=\"datetime-local\" value=\"{_default_sched}\" required></label>"
+                      f"<label>Repeat<select name=\"recurrence\">"
+                      f"<option value=\"once\">Once</option>"
+                      f"<option value=\"daily\">Daily</option>"
+                      f"<option value=\"weekly\">Weekly</option></select></label>"
+                      f"<button class=\"btn\" type=\"submit\">Queue for posting (v{latest.get('version', 1)})</button></form>"
+                      f"<p class=\"muted\">YouTube ke liye pehle Settings &gt; Connected apps me account connect karo — "
+                      f"bina account ke item \"waiting for account\" me rahega, kabhi fake post nahi hoga.</p></div>")
+    else:
+        queue_card = ("<div class=\"card\"><h3>Queue for posting</h3>"
+                      "<p class=\"muted\">Pehle upar Re-make se render karo — "
+                      "queue ke liye rendered MP4 chahiye.</p></div>")
     return f"""
 <h1>{esc(str(clip.get('clip_id')))} — {esc(str(clip.get('title') or clip.get('hook_line') or ''))}</h1>
 <p class="muted"><a href="/app/videos/{upload_id}">← Back to video</a> · {esc(str(row.get('original_name') if row else ''))} · {clip['start']}s – {clip['end']}s ({clip['duration']}s) · Source: {esc(source)}</p>
@@ -1694,6 +2096,9 @@ def _clip_detail_body(user: dict, upload_id: str, clip: dict,
 <div class="optrow"><div><label>Caption style<select id="rm-caption">{cap_opts}</select></label></div>
 <div><label>Frame layout<select id="rm-layout">{lay_opts}</select></label></div>
 <div><label>Video quality<select id="rm-quality">{qual_opts}</select></label></div></div>
+<div class="optrow"><div><label>Style preset (reference style)<select id="rm-style">{style_opts}</select></label></div>
+<div><label>Caption language<select id="rm-lang">{lang_opts}</select></label></div></div>
+<p class="muted">Caption language badalne par transcript dobara usi language me banega (Whisper) — purana transcript translate nahi hota.</p>
 <p id="rm-status" class="muted"></p>
 <p id="rm-error" class="err"></p>
 <button class="btn" type="submit">Save &amp; Re-make</button>
@@ -1702,6 +2107,7 @@ def _clip_detail_body(user: dict, upload_id: str, clip: dict,
 <div class="card"><h3>Versions ({len(versions)})</h3>{ver_html}
 <p><a class="btn ghost" href="/download/{upload_id}/{clip['clip_id']}">Download latest (ZIP)</a> '
 <a class="btn ghost" href="/rendered/{upload_id}/{clip['clip_id']}">Download latest MP4</a></p></div>
+{queue_card}
 <div class="card"><h3>Approve / Reject</h3>
 <form method="post" action="/approve-clip" style="display:inline">
 <input type="hidden" name="upload_id" value="{upload_id}">
@@ -1711,7 +2117,7 @@ def _clip_detail_body(user: dict, upload_id: str, clip: dict,
 <input type="hidden" name="upload_id" value="{upload_id}">
 <input type="hidden" name="clip_id" value="{clip['clip_id']}">
 <button class="btn ghost" type="submit">Reject</button></form>
-<p class="muted">Approve karne se Render All unlock hota hai.</p></div>
+<p class="muted">{'✅ Render All unlocked — is video ka ek test clip approved hai.' if gate_unlocked else '🔒 Render All locked — pehle 1 test clip approve karo, phir bulk render (Render All) chalega.'}</p></div>
 <script>
 const UID = "{upload_id}", CID = "{clip['clip_id']}";
 document.getElementById('remake-form').addEventListener('submit', async (e) => {{
@@ -1723,7 +2129,9 @@ document.getElementById('remake-form').addEventListener('submit', async (e) => {
     end: Number(document.getElementById('rm-end').value),
     caption_style: document.getElementById('rm-caption').value,
     layout: document.getElementById('rm-layout').value,
-    quality: document.getElementById('rm-quality').value}};
+    quality: document.getElementById('rm-quality').value,
+    caption_language: document.getElementById('rm-lang').value,
+    style_name: document.getElementById('rm-style').value}};
   try {{
     const r = await fetch('/remake-clip', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
     const j = await r.json();
@@ -1766,6 +2174,23 @@ def video_detail(request: Request, upload_id: str) -> HTMLResponse:
         clips_data, clips = {}, []
     probe = probe_video(ROOT / row["stored_path"])
     duration = probe["duration"] if probe["valid"] else 0.0
+    # Phase 9: approval-gate card — the same state the server enforces
+    # on POST /render-all (see workflow.get_project_status).
+    try:
+        _proj = get_project_status(upload_id)
+        _gate_locked = bool(_proj.get("render_all_locked", True))
+        _gate_msg = str(_proj.get("gate_message", ""))
+        _approved_list = ", ".join(_proj.get("approved_clips") or [])
+    except Exception:
+        _gate_locked, _gate_msg, _approved_list = True, "Gate state nahi mila — pehle clips banao.", ""
+    _gate_card = (f"<div class=\"card\"><h3>Render All — approval gate</h3>"
+                  f"<p>{_html.escape(_gate_msg)}</p>"
+                  + (f"<p class=\"muted\">Approved test clip: {_html.escape(_approved_list)}</p>" if _approved_list else "")
+                  + (f"<button class=\"btn\" type=\"button\" id=\"render-all-btn\">Render All ({len(clips)} clips)</button>"
+                     f"<p id=\"render-all-status\" class=\"muted\"></p><p id=\"render-all-error\" class=\"err\"></p>"
+                     if not _gate_locked and clips else
+                     "<p class=\"muted\">Render All tabhi chalega jab ek test clip approved ho — clip editor me kisi clip ko Approve dabao.</p>")
+                  + "</div>")
     if clips:
         clip_rows = "".join(
             f"<tr><td><a href=\"/app/videos/{upload_id}/clips/{c['clip_id']}\">{c['clip_id']}</a></td>"
@@ -1784,6 +2209,7 @@ def video_detail(request: Request, upload_id: str) -> HTMLResponse:
                  "se pehle transcribe + find-clips karo, ya neeche Hand clip banao.</p>")
     body = f"""<h1>{_html.escape(str(row['original_name']))}</h1>
 <p class="muted"><a href="/app/videos">← All videos</a> · {duration:.1f}s · {row['size_bytes'] // 1024} KB · {len(clips)} clips</p>
+{_gate_card}
 <div class="card"><h3>Clips</h3>{table}</div>
 <div class="card"><h3>Hand clip — manual range, no AI gate</h3>
 <p class="muted">Khud start/end do — AI judge nahi lagta. Scores sirf jaankari ke liye dikhte hain.</p>
@@ -1811,6 +2237,22 @@ document.getElementById('hand-form').addEventListener('submit', async (e) => {{
     setTimeout(() => location.href = '/app/videos/{upload_id}/clips/' + j.clip_id, 600);
   }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err; }}
 }});
+const raBtn = document.getElementById('render-all-btn');
+if (raBtn) {{
+  raBtn.addEventListener('click', async () => {{
+    const st = document.getElementById('render-all-status'), er = document.getElementById('render-all-error');
+    er.textContent = ''; st.textContent = 'Render All chal raha hai… har clip 1-3 min leta hai, page band mat karo.';
+    raBtn.disabled = true;
+    try {{
+      const fd = new FormData(); fd.append('upload_id', '{upload_id}');
+      const r = await fetch('/render-all', {{method:'POST', body: fd}});
+      const j = await r.json();
+      if (!r.ok) {{ er.textContent = 'Error: ' + (j.detail || 'render-all fail hua'); st.textContent = ''; raBtn.disabled = false; return; }}
+      st.textContent = j.message || 'Render-all done.';
+      setTimeout(() => location.reload(), 800);
+    }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err; raBtn.disabled = false; }}
+  }});
+}}
 </script>
 """
     return _app_layout(user, "All videos", body)
@@ -1848,7 +2290,8 @@ def clip_detail(request: Request, upload_id: str, clip_id: str) -> HTMLResponse:
     error = request.query_params.get("error", "")
     saved = request.query_params.get("saved", "") == "1"
     body = _clip_detail_body(user, upload_id, clip, versions,
-                             error=error, saved=saved)
+                             error=error, saved=saved,
+                             gate_unlocked=has_approved_clip(upload_id))
     return _app_layout(user, "All videos", body)
 
 
@@ -1973,9 +2416,21 @@ async def remake_clip_endpoint(request: Request):
             "caption_style": body.get("caption_style") or stored.get("caption_style"),
             "layout": body.get("layout") or stored.get("layout"),
             "quality": body.get("quality") or stored.get("quality"),
+            "caption_language": (body.get("caption_language")
+                                 or stored.get("caption_language")
+                                 # Phase 9 fallback: see /render-clip —
+                                 # the stored transcript's language wins
+                                 # over the English default.
+                                 or transcript.get("language_requested")),
         })
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Phase 9: per-clip language switch — re-transcribe if needed.
+    try:
+        transcript, _retrans = await _ensure_transcript_language(
+            video_path, upload_id, transcript, opts.get("caption_language"))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     try:
         clip = update_clip(upload_id, clip_id, updates)
     except (FileNotFoundError, KeyError) as exc:
@@ -1990,7 +2445,7 @@ async def remake_clip_endpoint(request: Request):
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"message": f"Re-make ho gaya — version {meta.get('version')}.",
-            **meta}
+            "retranscribed_for_language": _retrans, **meta}
 
 
 @app.post("/hand-clip")
@@ -2265,11 +2720,355 @@ def connected_apps(request: Request) -> HTMLResponse:
     user = _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    body = """<h1>Connected apps</h1><div class="card">
-<p><b>YouTube</b> — Post Shorts from here. <span class="muted">Connect — Phase 8 me aayega.</span></p>
-<p><b>Instagram</b> — Post Reels from here. <span class="muted">Not set up on this server.</span></p>
-<p><b>TikTok</b> — Post to TikTok from here. <span class="muted">Not set up on this server.</span></p></div>"""
+    err = request.query_params.get("error", "")
+    ok = request.query_params.get("connected", "") == "1"
+    disc = request.query_params.get("disconnected", "") == "1"
+    try:
+        yt = get_youtube_account(DB_PATH, user["id"])
+    except Exception:
+        yt = None
+    err_html = f'<p class="err">{_html.escape(err)}</p>' if err else ""
+    ok_html = ('<p style="color:#4ade80">YouTube connected ✓ — ab queue '
+               'kari hui Shorts post hongi.</p>' if ok else "")
+    disc_html = ('<p class="muted">YouTube disconnected — queued Shorts '
+                 '"waiting for account" me jayengi.</p>' if disc else "")
+    if yt:
+        yt_block = (f"<p><b>YouTube</b> — Post Shorts from here.</p>"
+                    f"<p>✅ Connected: <b>{_html.escape(yt['channel_name'] or yt['channel_id'])}</b> "
+                    f"<span class=\"muted\">({yt['status']})</span></p>"
+                    f"<form method=\"post\" action=\"/app/settings/apps/youtube/disconnect\" "
+                    f"onsubmit=\"return confirm('YouTube disconnect karo? Queued Shorts ruk jayengi.');\">"
+                    f"<button class=\"btn ghost\" type=\"submit\">Disconnect YouTube</button></form>")
+    elif youtube_oauth_configured():
+        yt_block = ("<p><b>YouTube</b> — Post Shorts from here.</p>"
+                    "<p class=\"muted\">Not connected yet.</p>"
+                    "<a class=\"btn\" href=\"/app/settings/apps/youtube/connect\">"
+                    "Connect YouTube</a>")
+    else:
+        missing = ", ".join(youtube_oauth_missing())
+        yt_block = ("<p><b>YouTube</b> — Post Shorts from here.</p>"
+                    "<p class=\"muted\">Connect ke liye Google OAuth client chahiye — "
+                    f"yeh values set karo (Google Cloud Console se): <b>{_html.escape(missing)}</b> "
+                    "(+ usi project me YouTube Data API v3 enable karo). "
+                    "Tab tak queued Shorts \"waiting for account\" me rahengi.</p>")
+    body = (f"<h1>Connected apps</h1>{err_html}{ok_html}{disc_html}"
+            f"<div class=\"card\">{yt_block}</div>"
+            "<div class=\"card\">"
+            "<p><b>Instagram</b> — Post Reels from here. "
+            "<span class=\"muted\">Not set up on this server.</span></p>"
+            "<p><b>TikTok</b> — Post to TikTok from here. "
+            "<span class=\"muted\">Not set up on this server.</span></p>"
+            "<p class=\"muted\">CreativeCut me bhi dono \"Not set up on this server\" "
+            "likhe the — inke liye official API + approval chahiye, isliye "
+            "Phase 8 me sirf YouTube wired hai.</p></div>")
     return _app_layout(user, "Settings", body)
+
+
+# ---------------------------------------------------------- Phase 8: posting queue
+
+def _queue_item_for_user(request: Request, item_id: str) -> tuple[dict | None, dict | None]:
+    """(item, error) — error is {"status": 404|403, "detail": ...}."""
+    item = get_queue_item(DB_PATH, item_id)
+    if not item:
+        return None, {"status": 404, "detail": f"queue item nahi mila: {item_id}"}
+    user = _current_user(request)
+    if not user or user["id"] != item["user_id"]:
+        return None, {"status": 403,
+                      "detail": "Ye queue item tumhara nahi hai"}
+    return item, None
+
+
+def _post_queue_body(user: dict, items: list[dict], paused_all: bool,
+                     notice: str = "") -> str:
+    """HTML body for /app/post-queue."""
+    counts = queue_counts(DB_PATH, user["id"])
+    notice_html = (f'<p style="color:#4ade80">{_html.escape(notice)}</p>'
+                   if notice else "")
+    groups = [("Queued — due items apne time par post honge",
+               [i for i in items if i["status"] in ("queued", "waiting_account")]),
+              ("Not set up — is platform par posting configured nahi hai",
+               [i for i in items if i["status"] == "not_set_up"]),
+              ("Posted ✓ (sirf asli platform URL ke saath)",
+               [i for i in items if i["status"] == "posted"]),
+              ("Failed — Retry dabakar dobara try karo",
+               [i for i in items if i["status"] == "failed"]),
+              ("Cancelled",
+               [i for i in items if i["status"] == "cancelled"])]
+    sections = ""
+    for title, group in groups:
+        if not group:
+            continue
+        rows = ""
+        for it in group:
+            platform = PLATFORMS[it["platform"]]["label"]
+            sched = format_ist(it["scheduled_at"])
+            status_chip = it["status"]
+            if it["paused"]:
+                status_chip += " · ⏸ paused"
+            posted = (f"<a href=\"{_html.escape(it['posted_url'])}\">"
+                      f"{_html.escape(it['posted_url'])}</a>"
+                      if it.get("posted_url") else "—")
+            err = (_html.escape(it["last_error"]) if it.get("last_error")
+                   else "—")
+            actions = ""
+            if it["status"] in ("queued", "waiting_account", "not_set_up"):
+                if it["paused"]:
+                    actions += (f"<form method=\"post\" action=\"/app/post-queue/{it['id']}/resume\" "
+                                f"style=\"display:inline\"><button class=\"btn ghost\" type=\"submit\">Resume</button></form> ")
+                else:
+                    actions += (f"<form method=\"post\" action=\"/app/post-queue/{it['id']}/pause\" "
+                                f"style=\"display:inline\"><button class=\"btn ghost\" type=\"submit\">Pause</button></form> ")
+                actions += (f"<form method=\"post\" action=\"/app/post-queue/{it['id']}/cancel\" "
+                            f"style=\"display:inline\"><button class=\"btn ghost\" type=\"submit\">Cancel</button></form> ")
+            if it["status"] in ("failed", "waiting_account", "not_set_up"):
+                actions += (f"<form method=\"post\" action=\"/app/post-queue/{it['id']}/retry\" "
+                            f"style=\"display:inline\"><button class=\"btn ghost\" type=\"submit\">Retry</button></form> ")
+            rows += (f"<tr><td>{_html.escape(it['title'])}</td>"
+                     f"<td>{platform}</td><td>{sched}</td>"
+                     f"<td>{_html.escape(it['recurrence'])}</td>"
+                     f"<td>{_html.escape(status_chip)}</td>"
+                     f"<td>{posted}</td><td>{err}</td><td>{actions}</td></tr>")
+        sections += (f"<div class=\"card\"><h3>{title} ({len(group)})</h3>"
+                     f"<table><tr><th>Title</th><th>Platform</th><th>Post at (IST)</th>"
+                     f"<th>Repeat</th><th>Status</th><th>Posted URL</th>"
+                     f"<th>Last error</th><th>Actions</th></tr>{rows}</table></div>")
+    if not sections:
+        sections = ("<div class=\"card\"><p class=\"muted\">Abhi kuch queued nahi hai — "
+                    "kisi clip ke editor page se \"Queue for posting\" dabao.</p></div>")
+    pause_label = "Resume all posting" if paused_all else "Pause all posting"
+    pause_note = ("<p class=\"muted\">⏸ Paused — worker kuch post nahi karega.</p>"
+                  if paused_all else
+                  "<p class=\"muted\">▶ Posting on — due items apne time par post honge.</p>")
+    return (f"<h1>Post queue</h1>{notice_html}"
+            f"<p class=\"muted\">{counts['waiting']} waiting · "
+            f"{counts['posted_total']} posted · {counts['failed']} failed · "
+            f"aaj {counts['posted_today']} posted</p>"
+            f"{pause_note}"
+            f"<form method=\"post\" action=\"/app/post-queue/pause-all\" style=\"display:inline\">"
+            f"<button class=\"btn ghost\" type=\"submit\">{pause_label}</button></form> "
+            f"<a class=\"btn ghost\" href=\"/app/settings/apps\">Connected apps</a>"
+            f"{sections}")
+
+
+@app.get("/app/post-queue", response_class=HTMLResponse)
+def post_queue_page(request: Request) -> HTMLResponse:
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    notice = ""
+    if request.query_params.get("queued") == "1":
+        notice = "Queued ✓ — scheduled time par post hoga (ya \"waiting for account\" me rahega jab tak YouTube connect na ho)."
+    items = list_queue(DB_PATH, user["id"])
+    body = _post_queue_body(user, items, is_paused_all(DB_PATH, user["id"]),
+                            notice=notice)
+    return _app_layout(user, "Post queue", body)
+
+
+@app.post("/app/post-queue")
+async def post_queue_create(request: Request):
+    """Queue a rendered clip version for posting (JSON or form).
+
+    Body: upload_id, clip_id, version (default latest), platform,
+    title, description, hashtags, privacy, scheduled_at
+    (datetime-local, Asia/Kolkata), recurrence. The render version
+    must exist — the worker uploads that exact MP4 file.
+    """
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    body = await _read_body(request)
+    is_json = "application/json" in (request.headers.get("content-type") or "").lower()
+    upload_id = str(body.get("upload_id") or "")
+    clip_id = str(body.get("clip_id") or "")
+    if not upload_id or not clip_id:
+        raise HTTPException(status_code=400, detail="upload_id aur clip_id chahiye")
+    if not _get_upload_row(upload_id):
+        raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
+    try:
+        _, clip = _clip_or_404(upload_id, clip_id)
+    except HTTPException as exc:
+        raise exc
+    try:
+        version = int(body.get("version") or 0) or None
+        meta = find_render_info(upload_id, clip_id, version=version)
+    except Exception:
+        meta = None
+    if meta is None:
+        # find_render_info returns None (not an exception) when no
+        # render exists — check explicitly, or this becomes a 500.
+        raise HTTPException(
+            status_code=404,
+            detail=f"Rendered clip nahi mila: {clip_id} — pehle render karo, "
+                   "queue ke liye rendered MP4 chahiye")
+    version = int(meta.get("version") or 1)
+    platform = str(body.get("platform") or "youtube")
+    title = str(body.get("title") or clip.get("title")
+                or clip.get("hook_line") or "")
+    description = str(body.get("description") or clip.get("description") or "")
+    hashtags = str(body.get("hashtags") or clip.get("hashtags") or "")
+    privacy = str(body.get("privacy") or "unlisted")
+    recurrence = str(body.get("recurrence") or "once")
+    try:
+        scheduled = parse_ist_datetime_local(str(body.get("scheduled_at") or ""))
+    except ValueError as exc:
+        detail = str(exc)
+        if is_json:
+            raise HTTPException(status_code=400, detail=detail)
+        return RedirectResponse(
+            f"/app/videos/{upload_id}/clips/{clip_id}?error={detail}",
+            status_code=303)
+    try:
+        item = queue_clip(DB_PATH, user["id"], upload_id, clip_id, version,
+                          platform, title, description=description,
+                          hashtags=hashtags, privacy=privacy,
+                          scheduled_at=scheduled, recurrence=recurrence)
+    except ValueError as exc:
+        detail = str(exc)
+        if is_json:
+            raise HTTPException(status_code=400, detail=detail)
+        return RedirectResponse(
+            f"/app/videos/{upload_id}/clips/{clip_id}?error={detail}",
+            status_code=303)
+    if is_json:
+        return JSONResponse(status_code=201, content={"message": "Queued.",
+                                                      "item": item})
+    return RedirectResponse("/app/post-queue?queued=1", status_code=303)
+
+
+@app.post("/app/post-queue/{item_id}/pause")
+async def post_queue_pause(request: Request, item_id: str):
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    item, err = _queue_item_for_user(request, item_id)
+    if err:
+        raise HTTPException(status_code=err["status"], detail=err["detail"])
+    return _post_queue_action_response(request, pause_item(DB_PATH, item_id))
+
+
+@app.post("/app/post-queue/{item_id}/resume")
+async def post_queue_resume(request: Request, item_id: str):
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    item, err = _queue_item_for_user(request, item_id)
+    if err:
+        raise HTTPException(status_code=err["status"], detail=err["detail"])
+    return _post_queue_action_response(request, resume_item(DB_PATH, item_id))
+
+
+@app.post("/app/post-queue/{item_id}/cancel")
+async def post_queue_cancel(request: Request, item_id: str):
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    item, err = _queue_item_for_user(request, item_id)
+    if err:
+        raise HTTPException(status_code=err["status"], detail=err["detail"])
+    return _post_queue_action_response(request, cancel_item(DB_PATH, item_id))
+
+
+@app.post("/app/post-queue/{item_id}/retry")
+async def post_queue_retry(request: Request, item_id: str):
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    item, err = _queue_item_for_user(request, item_id)
+    if err:
+        raise HTTPException(status_code=err["status"], detail=err["detail"])
+    return _post_queue_action_response(request, retry_item(DB_PATH, item_id))
+
+
+def _post_queue_action_response(request: Request, item: dict | None):
+    """After a queue action: JSON for API callers, redirect for forms."""
+    is_json = "application/json" in (request.headers.get("content-type") or "").lower()
+    if is_json:
+        if item is None:
+            raise HTTPException(status_code=404, detail="queue item nahi mila")
+        return {"message": "OK.", "item": item}
+    return RedirectResponse("/app/post-queue", status_code=303)
+
+
+@app.post("/app/post-queue/pause-all")
+async def post_queue_pause_all(request: Request):
+    """Toggle Pause all posting for this user (form or JSON)."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    body = await _read_body(request)
+    is_json = "application/json" in (request.headers.get("content-type") or "").lower()
+    if "paused" in body:
+        paused = str(body.get("paused")).lower() in ("1", "true", "yes", "on")
+    else:
+        paused = not is_paused_all(DB_PATH, user["id"])
+    set_pause_all(DB_PATH, user["id"], paused)
+    if is_json:
+        return {"paused_all": paused,
+                "message": ("Posting paused — worker kuch post nahi karega."
+                            if paused else "Posting resumed.")}
+    return RedirectResponse("/app/post-queue", status_code=303)
+
+
+@app.get("/app/settings/apps/youtube/connect")
+def youtube_connect(request: Request):
+    """Start the YouTube OAuth flow (youtube.upload scope).
+
+    Fails cleanly with a message when the OAuth client is not
+    configured — no credentials are invented.
+    """
+    from urllib.parse import quote as _quote
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        url = youtube_auth_url(user["id"])
+    except RuntimeError as exc:
+        return RedirectResponse(
+            f"/app/settings/apps?error={_quote(str(exc))}", status_code=303)
+    return RedirectResponse(url, status_code=303)
+
+
+@app.get("/auth/youtube/callback")
+def youtube_callback(request: Request):
+    """Google redirects here after the user approves the
+    youtube.upload scope. UNTESTED live — no OAuth client exists
+    yet, so this path cannot be exercised until the user supplies
+    GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / YOUTUBE_REDIRECT_URI
+    (see README). With them missing it fails cleanly."""
+    from urllib.parse import quote as _quote
+    err = request.query_params.get("error", "")
+    if err:
+        return RedirectResponse(
+            f"/app/settings/apps?error={_quote('Google ne access deny kiya: ' + err)}",
+            status_code=303)
+    code = request.query_params.get("code", "")
+    state = request.query_params.get("state", "")
+    user_id = consume_oauth_state(state)
+    if not user_id or not code:
+        return RedirectResponse(
+            "/app/settings/apps?error=" + _quote(
+                "YouTube connect fail hua — state/code missing (dobara Connect dabao)."),
+            status_code=303)
+    try:
+        tokens = exchange_youtube_code(code)
+        channel = get_youtube_channel(tokens["access_token"])
+        save_youtube_account(DB_PATH, user_id, tokens, channel)
+    except Exception as exc:
+        return RedirectResponse(
+            f"/app/settings/apps?error={_quote(str(exc))}", status_code=303)
+    return RedirectResponse("/app/settings/apps?connected=1", status_code=303)
+
+
+@app.post("/app/settings/apps/youtube/disconnect")
+def youtube_disconnect(request: Request):
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    delete_youtube_account(DB_PATH, user["id"])
+    return RedirectResponse("/app/settings/apps?disconnected=1",
+                            status_code=303)
 
 
 @app.get("/app/settings/ai", response_class=HTMLResponse)
@@ -2446,7 +3245,6 @@ async def create_youtube_job_endpoint(request: Request, payload: dict) -> dict:
         clean_url = validate_youtube_url(url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    language = str(payload.get("language") or "en")
     raw_options = payload.get("options") or {}
     if not isinstance(raw_options, dict):
         raise HTTPException(status_code=400, detail="options ek object hona chahiye")
@@ -2454,6 +3252,10 @@ async def create_youtube_job_endpoint(request: Request, payload: dict) -> dict:
         opts = parse_options(raw_options)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Phase 9: the Options panel's caption language drives the job's
+    # transcription language (payload `language` still wins if sent).
+    language = normalize_language(
+        str(payload.get("language") or opts.get("caption_language") or "en"))
     # top_n: explicit payload value wins over options only when the
     # caller sent one; otherwise the Options panel's count rules.
     top_n = payload.get("top_n")

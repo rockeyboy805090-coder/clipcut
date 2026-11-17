@@ -432,15 +432,16 @@ def render_clip(video_path, upload_id: str, clip: dict,
     layout_opt = (str(opts["layout"]).strip().lower()
                   if opts.get("layout") else None)
     quality = str(opts.get("quality") or "1080p").strip().lower()
-    if caption_style not in ("bounce", "hype", "clean"):
+    if caption_style not in ("bounce", "hype", "clean", "custom"):
         raise ValueError(f"Caption style galat hai: {caption_style!r}")
-    if layout_opt is not None and layout_opt not in ("blurred_fill", "zoomed_in", "fill_screen"):
+    if layout_opt is not None and layout_opt not in ("blurred_fill", "zoomed_in", "fill_screen", "face_track"):
         raise ValueError(f"Layout galat hai: {layout_opt!r}")
     out_w, out_h = render_size(quality)
     resolved_options = {"caption_style": caption_style,
                         "layout": layout_opt or "auto",
                         "quality": quality,
-                        "video_type": str(opts.get("video_type") or "auto")}
+                        "video_type": str(opts.get("video_type") or "auto"),
+                        "caption_language": str(opts.get("caption_language") or "en")}
 
     clip_id = str(clip.get("clip_id") or "clip_01")
     start = float(clip.get("start", 0.0))
@@ -459,9 +460,24 @@ def render_clip(video_path, upload_id: str, clip: dict,
     profile_name = str(style.get("style_name", style_name or "global-baatien"))
 
     # --- Face detection (drives reframe mode, unless layout forces it) ---
+    src_w, src_h = probe["width"], probe["height"]
     face = detect_face_centre(video_path, clip_start, clip_end)
     face_crop_ok = bool(face["face_detected"] and face["face_rel_width"] >= 0.12)
-    if layout_opt == "blurred_fill":
+    # Phase 9: face_track — per-second track, crop window MOVES with
+    # the face (see face_track.py). No detection at all -> centre
+    # crop fallback, recorded honestly in the sidecar (never claimed).
+    face_track = None
+    face_track_expr = None
+    if layout_opt == "face_track":
+        from face_track import face_track_crop_expr, track_face  # local
+        use_crop = True
+        face_track = track_face(video_path, clip_start, clip_end)
+        if face_track.get("face_detected"):
+            face_track_expr = face_track_crop_expr(face_track, src_w, src_h)
+            if face_track_expr is None:
+                face_track["note"] += (" — source already narrower than "
+                                       "9:16, no crop needed (centre used)")
+    elif layout_opt == "blurred_fill":
         # Full frame, blurred video filling the rest — never crop.
         use_crop = False
     elif layout_opt in ("zoomed_in", "fill_screen"):
@@ -471,8 +487,11 @@ def render_clip(video_path, upload_id: str, clip: dict,
     else:
         use_crop = face_crop_ok
     zoom_extra = 1.12 if layout_opt == "zoomed_in" else 1.0
-    reframe_mode = "centre_crop" if use_crop else "blur_fill"
-    src_w, src_h = probe["width"], probe["height"]
+    if layout_opt == "face_track":
+        reframe_mode = ("face_track" if face_track_expr else
+                        "centre_crop")
+    else:
+        reframe_mode = "centre_crop" if use_crop else "blur_fill"
 
     # --- Captions (keep Whisper text exactly as returned) ---
     clip_text = str(clip.get("transcript_text") or "").strip()
@@ -532,21 +551,47 @@ def render_clip(video_path, upload_id: str, clip: dict,
     rel_end = round(rel_start + duration, 2)
     if use_crop:
         crop_w = int(src_h * 9 / 16)
-        face_cx = face["centre_x"] if face["face_detected"] else 0.5
-        crop_x = int(max(0, min(src_w - crop_w,
-                                face_cx * src_w - crop_w / 2)))
-        if zoom_extra > 1.0:
-            # Zoomed in: crop 9:16, scale 12% bigger, centre-crop back
-            # to the output size — the speaker fills more of the frame.
-            zw2 = int(out_w * zoom_extra) // 2 * 2
-            zh2 = int(out_h * zoom_extra) // 2 * 2
-            base = (f"[0:v]trim=start={rel_start}:end={rel_end},setpts=PTS-STARTPTS,"
-                    f"fps=30,crop={crop_w}:{src_h}:{crop_x}:0,"
-                    f"scale={zw2}:{zh2}:flags=lanczos,crop={out_w}:{out_h}[vbase]")
+        crop_w = (crop_w // 2) * 2
+        if face_track_expr:
+            # Phase 9: time-varying crop x — the window follows the
+            # face (1s segments). The expression's commas must be
+            # quoted for the filter parser; the graph is one argv, so
+            # ffmpeg itself parses the quotes.
+            crop_x_expr = f"'{face_track_expr}'"
+            if zoom_extra > 1.0:
+                zw2 = int(out_w * zoom_extra) // 2 * 2
+                zh2 = int(out_h * zoom_extra) // 2 * 2
+                base = (f"[0:v]trim=start={rel_start}:end={rel_end},setpts=PTS-STARTPTS,"
+                        f"fps=30,crop={crop_w}:{src_h}:{crop_x_expr}:0,"
+                        f"scale={zw2}:{zh2}:flags=lanczos,crop={out_w}:{out_h}[vbase]")
+            else:
+                base = (f"[0:v]trim=start={rel_start}:end={rel_end},setpts=PTS-STARTPTS,"
+                        f"fps=30,crop={crop_w}:{src_h}:{crop_x_expr}:0,"
+                        f"scale={out_w}:{out_h}:flags=lanczos[vbase]")
+            # face_track path is done — skip the static-crop code below.
+            face = dict(face)
+            face["centre_x"] = (face_track or {}).get("centre_x", 0.5)
+            face["face_detected"] = bool((face_track or {}).get("face_detected"))
+            face["face_rel_width"] = (face_track or {}).get("face_rel_width", 0.0)
+            _face_track_base_done = True
         else:
-            base = (f"[0:v]trim=start={rel_start}:end={rel_end},setpts=PTS-STARTPTS,"
-                    f"fps=30,crop={crop_w}:{src_h}:{crop_x}:0,"
-                    f"scale={out_w}:{out_h}:flags=lanczos[vbase]")
+            _face_track_base_done = False
+        if not _face_track_base_done:
+            face_cx = face["centre_x"] if face["face_detected"] else 0.5
+            crop_x = int(max(0, min(src_w - crop_w,
+                                    face_cx * src_w - crop_w / 2)))
+            if zoom_extra > 1.0:
+                # Zoomed in: crop 9:16, scale 12% bigger, centre-crop back
+                # to the output size — the speaker fills more of the frame.
+                zw2 = int(out_w * zoom_extra) // 2 * 2
+                zh2 = int(out_h * zoom_extra) // 2 * 2
+                base = (f"[0:v]trim=start={rel_start}:end={rel_end},setpts=PTS-STARTPTS,"
+                        f"fps=30,crop={crop_w}:{src_h}:{crop_x}:0,"
+                        f"scale={zw2}:{zh2}:flags=lanczos,crop={out_w}:{out_h}[vbase]")
+            else:
+                base = (f"[0:v]trim=start={rel_start}:end={rel_end},setpts=PTS-STARTPTS,"
+                        f"fps=30,crop={crop_w}:{src_h}:{crop_x}:0,"
+                        f"scale={out_w}:{out_h}:flags=lanczos[vbase]")
     else:
         # Blur-fill background, blurred at QUARTER resolution (Phase 6
         # fix, 15 Nov 2026): blurring full 1080x1920 at sigma=40 was
@@ -643,6 +688,13 @@ def render_clip(video_path, upload_id: str, clip: dict,
             f"Language setting: {lang_requested} (English default), but captions are in "
             f"{caption_script} script — the source audio is Hindi, so Whisper heard Hindi "
             f"words. English captions need English audio; nothing was translated.")
+    elif lang_requested == "hi" and caption_script != "devanagari":
+        language_note = (
+            f"Language setting: Hindi (hi), but captions came back in {caption_script} "
+            f"script, not Devanagari — Whisper did not decode this audio as Hindi. "
+            f"Nothing was translated or rewritten; check the source audio.")
+    elif lang_requested == "hi":
+        language_note = "Captions in Hindi (Devanagari script) as requested."
     elif caption_script == "latin":
         language_note = "Captions in English words (Roman script) as requested."
     else:
@@ -657,6 +709,19 @@ def render_clip(video_path, upload_id: str, clip: dict,
         "created_at": _dt.now(_tz.utc).isoformat(),
         "language_requested": lang_requested,
         "language_note": language_note,
+        "caption_language": lang_requested,
+        # Phase 9: face-track record — what was actually tracked (or
+        # that it fell back). Never claims tracking without detection.
+        "face_track": ({
+            "requested": True,
+            "tracked": bool(face_track_expr),
+            "frames_checked": (face_track or {}).get("frames_checked", 0),
+            "frames_with_face": (face_track or {}).get("frames_with_face", 0),
+            "segments": (face_track or {}).get("segments", []),
+            "note": ((face_track or {}).get("note", "")
+                     or "face_track not requested"),
+        } if layout_opt == "face_track" else {
+            "requested": False, "tracked": False, "note": "face_track not requested"}),
         "style_name": profile_name,
         "style_slug": style_name or "global-baatien",
         "start": start, "end": end,
@@ -685,7 +750,11 @@ def render_clip(video_path, upload_id: str, clip: dict,
         "caption_words": sum(len(p["words"]) for p in phrases),
         "reframe_mode": reframe_mode,
         "layout": layout_opt or "auto",
-        "layout_note": ("blurred fill forced (face crop ignored)" if layout_opt == "blurred_fill"
+        "layout_note": ("face tracked 1 Hz — crop window follows the face"
+                        if layout_opt == "face_track" and face_track_expr
+                        else "face_track requested but no face found — centre crop used, tracking NOT claimed"
+                        if layout_opt == "face_track"
+                        else "blurred fill forced (face crop ignored)" if layout_opt == "blurred_fill"
                         else "zoomed in 12% over centre-crop" if layout_opt == "zoomed_in"
                         else "full-frame crop, no bars" if layout_opt == "fill_screen"
                         else "auto: face -> centre-crop, else blur-fill"),

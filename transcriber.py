@@ -93,6 +93,22 @@ def normalize_language(value: str | None) -> str:
     return DEFAULT_LANGUAGE
 
 
+def normalize_language_strict(value: str | None) -> str:
+    """Like normalize_language, but an UNKNOWN value raises ValueError
+    instead of silently falling back to English. Use for user-facing
+    caption-language fields (find-clips / transcribe) — a typo like
+    "urdu" must be a clear 400, not a silent English job."""
+    v = (value or "").strip().lower()
+    if v in ("en", "english"):
+        return "en"
+    if v in ("hinglish", "hinglish-roman", "roman"):
+        return "hinglish"
+    if v in ("hi", "hindi"):
+        return "hi"
+    raise ValueError(
+        f"Caption language galat hai: {value!r} — English, Hindi ya Hinglish me se chuno")
+
+
 def _detect_script(text: str) -> str:
     if _ARABIC_RE.search(text or ""):
         return "arabic"
@@ -196,9 +212,29 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
         raise ValueError(f"Ye valid video file nahi hai: {probe['error']}")
     if not probe["has_audio"]:
         raise ValueError("Is video me audio nahi hai — transcript nahi ban sakta")
+    explicit_model = model_name is not None
     model_name = normalize_model(model_name)
     language_requested = normalize_language(
         language or os.getenv("WHISPER_LANGUAGE") or DEFAULT_LANGUAGE)
+    # Phase 9: Hindi (hi) needs the SMALL model for Devanagari script.
+    # Verified 17 Nov 2026 on real Hindi speech (75s, gTTS hi): base
+    # decodes Hindi words in URDU (Perso-Arabic) script (detected
+    # "hi", 180 words, script=arabic); small returns the same words
+    # in Devanagari (171 words, script=devanagari). The switch applies
+    # only when no explicit model was passed — the default base
+    # (param or WHISPER_MODEL env) is upgraded for hi. An explicit
+    # model still wins, and the mismatch is then recorded in
+    # language_note, never hidden.
+    # Cost, measured locally: small is ~3.7x realtime on this CPU
+    # (75s audio took ~280s vs base ~26s) and ~2x the RAM of base —
+    # on Render Free 512 MB it may OOM; untested there (no deploy in
+    # Phase 9). The model actually used is recorded in the output.
+    model_note = ""
+    if language_requested == "hi" and not explicit_model and model_name == "base":
+        model_name = "small"
+        model_note = ("Hindi (hi) needs the small model for Devanagari script — "
+                      "base returns Urdu script (verified 17 Nov 2026). "
+                      "Small is slower (~3.7x realtime) and uses ~2x RAM.")
     if initial_prompt is None:
         initial_prompt = (os.getenv("WHISPER_INITIAL_PROMPT")
                           or LANGUAGE_PROMPTS.get(language_requested))
@@ -282,6 +318,7 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
     out = {
         "upload_id": upload_id,
         "model": model_name,
+        "model_note": model_note,
         "engine": "faster-whisper",
         "language": detected_language,
         "language_requested": language_requested,
@@ -307,8 +344,15 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
     elif language_requested in ("en", "hinglish"):
         out["language_note"] = (
             "Transcript in English words (Roman script) as requested.")
+    elif language_requested == "hi" and script != "devanagari":
+        # Phase 9: never claim a Hindi transcript when Whisper
+        # actually returned another script — say so plainly.
+        out["language_note"] = (
+            f"Language setting: Hindi (hi), but transcript came back in {script} "
+            f"script, not Devanagari — Whisper did not decode this audio as Hindi. "
+            f"Nothing was translated or rewritten; check the source audio.")
     else:
-        out["language_note"] = "Transcript in Hindi as requested."
+        out["language_note"] = "Transcript in Hindi (Devanagari) as requested."
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     json_path = TRANSCRIPTS_DIR / f"{upload_id}.json"
     txt_path = TRANSCRIPTS_DIR / f"{upload_id}.txt"

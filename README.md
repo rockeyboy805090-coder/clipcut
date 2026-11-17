@@ -230,10 +230,54 @@ is real now; creators table has a Live? column + Check button.
   tested in a real browser yet; Gemini words judge still unverified
   live (no key ever set — all test clips rule_based).
 
-## Not done yet (Phases 8–10, see CLONE_PLAN.md §4)
+## Phase 8 (17 Nov 2026) — Posting queue (TEST-PASS, local real runs)
 
-Phase 8 posting queue · Phase 9 upgrades · Phase 10 polish + landing +
-legal pages + deploy.
+Full evidence: `../PHASE8_REPORT.md`. Queue a rendered clip version
+from its editor page ("Queue for posting") or `POST /app/post-queue`:
+platform (YouTube Shorts / Instagram / TikTok), title/description/
+hashtags (prefilled from the clip), privacy (public/unlisted/private,
+default unlisted), scheduled time (entered in Asia/Kolkata, stored in
+UTC), recurrence (once/daily/weekly). Queue page `/app/post-queue`:
+queued / waiting / posted / failed / cancelled groups with real
+counts; per-item Pause/Resume/Cancel/Retry; "Pause all posting"
+actually stops the worker for that user. Dashboard tiles "Posted
+today" and "Waiting to post" are real now, and the Activity card's
+Posted count comes from the queue.
+- **Worker:** one item at a time (same RAM rule as Phase 7), polls
+  every 20s. Every attempt is logged in `post_attempts` — including
+  the ones that never post. An item is `posted` only when the
+  platform returns a real video id; the platform URL is stored only
+  then.
+- **YouTube Shorts — real upload path, blocked on credentials:**
+  OAuth 2.0 (`youtube.upload` scope) + resumable upload to the
+  YouTube Data API v3 (`post_queue.py`: chunked PUT, 308 resume,
+  401 → token refresh once). The Google OAuth client does NOT
+  exist yet, so Connect fails cleanly and due YouTube items sit in
+  `waiting_account` (re-checked hourly) with the exact missing
+  values named. The callback (`/auth/youtube/callback`) is
+  UNTESTED live, like the Phase 1 Google sign-in callback.
+- **Instagram / TikTok:** "Not set up on this server" — the
+  reference app says the same. Queued items go to `not_set_up`;
+  the worker never pretends to post them.
+- **Limits:** a queued clip must already be rendered (the worker
+  uploads that exact MP4); a render longer than 60s warns that it
+  will post as a normal video, not a Short; Render Free sleeps
+  after 15 min idle, so a due post can be missed by a restart —
+  the item stays queued and the worker picks it up after wake
+  (or it can be Retried).
+
+## Phase 9 (17 Nov 2026) — Upgrades: file upload, Hindi/Hinglish captions, reference-style extractor, face-tracking crop, approval-gate extension (TEST-PASS, local real runs; report: `../PHASE9_REPORT.md`)
+
+- **File upload (link-free path):** the reference app has NO file upload anywhere — this is the upgrade. Dashboard `/app` now offers both: paste a link OR upload a file (`POST /app/upload`, login required, owner-attached, same 100 MB per-user quota, single file over 100 MB rejected with a clear error instead of deleting the user's other videos). Uploaded files enter the SAME pipeline (transcribe → find-clips → editor → post queue).
+- **Hindi/Hinglish captions:** caption language option (English / Hindi / Hinglish) on the Options panel and per-clip (clip editor Re-make). It is the Whisper DECODING language, threaded transcribe → find-clips → render; a different language re-transcribes (never translates an old transcript). Hindi in Devanagari needs the **small** Whisper model — base decodes Hindi words in Urdu script (verified live: base 180 words, script=arabic; small 171 words, script=devanagari) — so `hi` auto-upgrades base → small unless an explicit model is given (slower, ~3.7x realtime, ~2x RAM; Render Free 512 MB OOM risk untested). Wrong-script results are recorded in `language_note`, never hidden. New caption style **Custom (reference style)** — no preset overrides, so an extracted style's measured colours actually reach the render (Bounce/Hype/Clean would overwrite them).
+- **Reference-style extractor:** dashboard card (`POST /app/extract-style`, login required, STRICT) + clip-editor style picker. Caption colours/size/position are now MEASURED from the reference's caption band (white-text fraction, dominant saturated hue, MSER text regions) instead of hardcoded defaults; a busy test pattern no longer false-positives (saturation cap, verified). If no caption text can be read, it fails honestly with "style could not be read" and saves nothing. Extracted styles are picked per-clip in the editor (with Custom caption style).
+- **Face-tracking crop:** new layout "Face tracking" (`face_track.py`, NEW module). 1 Hz Haar sampling, largest face wins, hold-last on gaps, median-3 smoothing; the 9:16 crop window MOVES with the face via a time-varying ffmpeg crop expression (verified on a real panning face video: 41/41 frames tracked, face centred at t=2s and t=35s in sampled frames). Honest limits: 1 Hz sampling (up to ~1s lag, 1s steps), largest-face-wins (no identity tracking), frontal faces only. No face found → centre-crop fallback that SAYS SO in the sidecar (tracking never claimed without a detection).
+- **Test-clip approval gate (extended):** `/render-all` and `/approve-clip` / `/reject-clip` now require login + ownership (the guard used to be enforceable by anyone once a clip was approved). Gate state is explicit in project status (`render_all_locked`, `gate_message`) and shown on the video page (Render All button, locked/unlocked) and the clip page. Verified both ways: unapproved → 400, unauth → 401, approved → unlocked + renders.
+- **Bugs found & fixed during Phase 9 testing:** (1) `clip_finder.find_clips` built its own `options` dict without `caption_language`, so a Hindi project silently re-transcribed back to English at render time — fixed (recorded in clips file + transcript-language fallback in render/remake/render-all). (2) `normalize_language("urdu")` silently fell back to English — unknown caption languages are now a clear 400 (`normalize_language_strict`). (3) Caption presets overwrote extracted styles' measured colours — fixed with the Custom style (above).
+
+## Not done yet (Phase 10, see CLONE_PLAN.md §4)
+
+Phase 10 polish + landing + legal pages + deploy.
 
 ## Blocked / needs the user
 
