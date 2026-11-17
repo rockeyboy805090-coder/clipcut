@@ -267,7 +267,11 @@ def create_creator(db_path: Path, user_id: str, name: str,
         raise ValueError("Channel link http(s) se shuru hona chahiye")
     creator_id = uuid.uuid4().hex
     with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute("INSERT INTO creators VALUES (?, ?, ?, ?, ?, ?)",
+        # Phase 7 fix: explicit column list — the table gained 3
+        # live-status columns (last_live_*) in init_live_tables, so a
+        # bare VALUES (...) with 6 values broke creator creation.
+        conn.execute("INSERT INTO creators (id, user_id, name, channel_link,"
+                     " platform, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                      (creator_id, user_id, name.strip() or channel_link,
                       channel_link, detect_platform(channel_link), _now()))
         conn.commit()

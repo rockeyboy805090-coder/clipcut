@@ -559,7 +559,9 @@ def _gemini_api_key() -> str:
 
 
 def _gemini_words_judge(candidates: list[dict], video_type: str = "auto",
-                        language: str = "en") -> dict | None:
+                        language: str = "en", api_key: str | None = None,
+                        model: str | None = None,
+                        _usage: dict | None = None) -> dict | None:
     """The WORDS judge (Phase 3): Gemini reads ONLY what was said.
 
     Scores each candidate 0-100 on the transcript text alone — hook
@@ -571,58 +573,21 @@ def _gemini_words_judge(candidates: list[dict], video_type: str = "auto",
     then uses the rule-based words score instead.
     Phase 2: the video type (when not auto-detect) is passed in the
     prompt so the model prefers moments that fit that type.
+    Phase 6: the real call lives in ai_providers.gemini_words_judge
+    (shared prompt/parser + token usage); this is a thin wrapper so
+    old callers keep working. Pass api_key/model to use a per-user
+    key/model, else the env GEMINI_API_KEY + legacy model are used.
+    When _usage (a dict) is given it is filled with the token usage.
     """
-    key = _gemini_api_key()
+    from ai_providers import gemini_words_judge
+    key = (api_key or "").strip() or _gemini_api_key()
     if not key:
         return None
-    try:
-        import google.generativeai as genai  # type: ignore
-    except ImportError:
-        return None
-    try:
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        brief = "\n".join(
-            f"[{i}] {c['start']:.0f}-{c['end']:.0f}s | {c['text'][:300]}"
-            for i, c in enumerate(candidates))
-        type_line = ""
-        if (video_type or "auto").lower() != "auto":
-            type_line = (f"Video type: {video_type}. Prefer moments that "
-                         f"fit a {video_type} video. ")
-        prompt = (
-            "You are the WORDS judge for short video clips. Read ONLY "
-            "what was said in each candidate's transcript text — you "
-            "cannot hear the audio and you get no loudness or chat data. "
-            "Score each candidate 0-100 (hook in first 5 sec = 30, "
-            "emotion/curiosity = 30, complete idea = 20, loop "
-            "potential = 20). " + type_line +
-            "Reply ONLY as a JSON array, "
-            "no other text, no markdown fences, each item: "
-            '{"id": <index>, "score": <0-100>, "reason": "<short, in Hinglish>", '
-            '"hook_line": "<first striking line, copied from the text>"}.\n\n'
-            f"Candidates:\n{brief}")
-        resp = model.generate_content(prompt)
-        raw = (getattr(resp, "text", "") or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        data = json.loads(raw)
-        out: dict = {}
-        for d in data:
-            if not isinstance(d, dict) or "id" not in d:
-                continue
-            try:
-                idx = int(d["id"])
-            except (TypeError, ValueError):
-                continue
-            if 0 <= idx < len(candidates):
-                out[idx] = {
-                    "words_score": max(0, min(100, int(d.get("score", 0)))),
-                    "words_reason": str(d.get("reason", ""))[:200],
-                    "hook_line": str(d.get("hook_line", ""))[:160],
-                }
-        return out if out else None
-    except Exception:
-        return None
+    judged, usage = gemini_words_judge(
+        key, model or "gemini-1.5-flash", candidates, video_type, language)
+    if _usage is not None:
+        _usage.update(usage)
+    return judged
 
 
 def _gemini_rescore(candidates: list[dict],
@@ -653,7 +618,8 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
                max_sec: float | None = None, from_sec: float | None = None,
                to_sec: float | None = None, video_type: str = "auto",
                options: dict | None = None, video_path=None,
-               chat_activity=None) -> dict:
+               chat_activity=None, ai_config: dict | None = None,
+               ledger_ctx: dict | None = None) -> dict:
     """Find top viral clips from a transcript dict — DUAL-JUDGE (Phase 3).
 
     Returns {"upload_id", "scoring_method", "scoring_language",
@@ -710,14 +676,35 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
     except Exception:
         split_segments_count = segments_count
 
-    # --- WORDS judge: Gemini when a key is set, else rule-based. ---
+    # --- WORDS judge (Phase 6): per-user provider, else legacy env. ---
+    # ai_config None -> old behaviour (env GEMINI_API_KEY, legacy model).
+    # ai_config given -> ai_providers.score_words (any of the 8
+    # providers, or rule_based when no key / on any API failure).
+    # use_gemini=False forces rule-based, whatever the config says.
     words_judge = "rule_based"
+    words_provider = "—"
+    words_model = "—"
+    words_usage: dict = {"input_tokens": 0, "output_tokens": 0,
+                         "total_tokens": 0, "token_source": "none",
+                         "note": ""}
     judged = None
     if use_gemini and candidates:
-        judged = _gemini_words_judge(candidates, video_type=video_type,
-                                     language=lang)
-        if judged is not None:
-            words_judge = "gemini"
+        if ai_config is not None:
+            from ai_providers import score_words
+            judged, words_usage, words_judge = score_words(
+                ai_config, candidates, video_type=video_type, language=lang)
+            words_provider = str(ai_config.get("provider") or "gemini")
+            words_model = str(ai_config.get("model") or "")
+        else:
+            usage_holder: dict = {}
+            judged = _gemini_words_judge(candidates, video_type=video_type,
+                                         language=lang, _usage=usage_holder)
+            if usage_holder:
+                words_usage = usage_holder
+            if judged is not None:
+                words_judge = "gemini"
+                words_provider = "gemini"
+                words_model = "gemini-1.5-flash"
     scoring_method = words_judge
     for i, cand in enumerate(candidates):
         rule_score = int(cand["score"])
@@ -802,6 +789,8 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
             "words_score": int(cand["words_score"]),
             "words_reason": cand["words_reason"],
             "words_judge": words_judge,
+            "words_provider": words_provider,
+            "words_model": words_model,
             "reaction_score": int(cand["reaction_score"]),
             "reaction_reason": cand["reaction_reason"],
             "reaction_breakdown": cand.get("reaction_breakdown"),
@@ -828,6 +817,40 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
             "video_type": video_type,
             "breakdown": cand.get("breakdown"),
         })
+    # --- Phase 6 ledger: log every AI attempt for this run. ---
+    # Three rows per find_clips: "finding clips" (summary, 0 tokens —
+    # the real tokens live on the "words judge" row, so totals are
+    # never double-counted), "words judge" (real/estimated/0 tokens),
+    # "reaction judge" (always 0 tokens — loudness, not an LLM call).
+    # Logging must never break clip finding — any failure is swallowed.
+    if ledger_ctx:
+        try:
+            from ai_ledger import log_ai_call
+            _db = ledger_ctx.get("db_path")
+            _uid = ledger_ctx.get("user_id")
+            _cid = ledger_ctx.get("creator_id")
+            log_ai_call(_db, _uid, "finding clips",
+                        provider=words_provider, model=words_model,
+                        upload_id=upload_id, creator_id=_cid,
+                        method=scoring_method, status="ok",
+                        note=(f"{len(candidates)} candidates, "
+                              f"{len(kept)} kept after the dual-judge gate"))
+            _wj_status = "ok" if judged is not None else "fallback"
+            log_ai_call(_db, _uid, "words judge",
+                        provider=words_provider, model=words_model,
+                        upload_id=upload_id, creator_id=_cid,
+                        input_tokens=int(words_usage.get("input_tokens") or 0),
+                        output_tokens=int(words_usage.get("output_tokens") or 0),
+                        token_source=words_usage.get("token_source", "none"),
+                        method=words_judge, status=_wj_status,
+                        note=words_usage.get("note", ""))
+            log_ai_call(_db, _uid, "reaction judge",
+                        provider="—", model="—",
+                        upload_id=upload_id, creator_id=_cid,
+                        method=reaction_judge_name, status="ok",
+                        note="Loudness (+ chat when supplied) — no LLM call")
+        except Exception:
+            pass
     out = {
         "upload_id": upload_id,
         "scoring_method": scoring_method,
@@ -851,6 +874,10 @@ def find_clips(transcript: dict, upload_id: str, top_n: int = 5,
         },
         "judges": {
             "words_judge": words_judge,
+            "words_provider": words_provider,
+            "words_model": words_model,
+            "words_tokens": int(words_usage.get("total_tokens") or 0),
+            "words_token_source": words_usage.get("token_source", "none"),
             "reaction_judge": reaction_judge_name,
             "words_threshold": words_threshold,
             "reaction_threshold": reaction_threshold,

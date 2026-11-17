@@ -21,3 +21,9 @@ yt-dlp>=2024.8,<2027
 # youtube_job.py — without it impersonation silently falls back to
 # plain yt-dlp. Free, no key. Wheels ship prebuilt libcurl.
 curl-cffi>=0.10,<1.0
+# Phase 6 — BYOK provider calls + per-user key encryption:
+# cryptography (Fernet, PBKDF2) encrypts saved API keys at rest;
+# requests is the HTTP client for OpenAI-compatible / Claude / Ollama
+# chat APIs and model listing (Gemini still uses google-generativeai).
+cryptography>=42,<51
+requests>=2.32,<3.0

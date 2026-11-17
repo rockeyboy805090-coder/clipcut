@@ -14,6 +14,12 @@ Phase 4 (new): workflow / history / batch / test-clip approval —
 Phase 5 (new): download/share — per-clip + whole-project ZIPs,
   caption JSON for copy, share guide; per-upload render namespace.
 Phase 6 (not yet): GitHub + Render deploy (needs user's GitHub username).
+Phase 7 (new): live recorder — browser MediaRecorder capture in ~60s
+  chunks (POST /live/start, /live/{id}/chunk, /live/{id}/stop), each
+  chunk transcribed + dual-judge scored + rendered while live; channel
+  live-status check via yt-dlp (POST /live/check); URL capture via
+  yt-dlp into kill-tolerant .mkv (POST /live/start-from-url). Single
+  worker thread, one chunk at a time — Render Free 512 MB rule.
 V2 (16 Nov 2026): YouTube link -> fully edited clips, automatically —
   POST /youtube-job + GET /youtube-job/{id} (background worker in
   youtube_job.py: yt-dlp download -> transcribe -> find-clips ->
@@ -37,6 +43,10 @@ import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
+from ai_ledger import init_ai_tables, log_ai_call, today_counts, usage_summary
+from ai_providers import (PROVIDERS, clear_ai_key, get_ai_settings,
+                          get_effective_ai_config, list_models_for_provider,
+                          save_ai_settings)
 from auth import (SESSION_COOKIE, STORAGE_QUOTA_BYTES, create_creator,
                   create_session, create_user, delete_all_sessions,
                   delete_creator, delete_session, delete_user,
@@ -64,6 +74,14 @@ from workflow import (create_batch, delete_project, get_batch,
 from youtube_job import (create_youtube_job, get_youtube_job,
                          init_youtube_jobs_table, run_youtube_job,
                          validate_youtube_url, youtube_runtime_diagnostics)
+from live_recorder import (check_channel_live, count_live_sessions,
+                           create_live_session, ensure_live_worker,
+                           get_creator_live_status, get_live_session,
+                           init_live_tables, list_live_sessions,
+                           live_worker_status, record_channel_check,
+                           reconcile_live_state, register_chunk,
+                           session_public, set_live_db_path,
+                           start_url_session, stop_live_session)
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -88,6 +106,11 @@ CHUNK_SIZE = 1024 * 1024
 async def lifespan(_: FastAPI):
     init_db()
     ensure_default_profile(STYLES_DIR)
+    # Phase 7: live recorder tables + the single chunk worker thread
+    # (one chunk at a time — Render Free 512 MB rule).
+    set_live_db_path(DB_PATH)
+    reconcile_live_state(DB_PATH)
+    ensure_live_worker()
     status = ffmpeg_status()
     if status["available"]:
         print(f"[startup] FFmpeg OK: {status['version']}", flush=True)
@@ -96,7 +119,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ClipCut", version="0.10.0-phase5", lifespan=lifespan)
+app = FastAPI(title="ClipCut", version="0.12.0-phase7", lifespan=lifespan)
 
 
 def init_db() -> None:
@@ -120,8 +143,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE uploads ADD COLUMN creator_id TEXT")
         conn.commit()
     init_auth_tables(DB_PATH)
+    init_ai_tables(DB_PATH)
     init_workflow_tables()
     init_youtube_jobs_table()
+    init_live_tables(DB_PATH)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -137,9 +162,10 @@ def health() -> JSONResponse:
     # --version + one --list-impersonate-targets at first call) —
     # cheap, and they prove on the LIVE instance whether node and
     # browser impersonation are actually available there.
-    return JSONResponse({"status": "ok", "phase": 5, "app": "clipcut-phase5",
+    return JSONResponse({"status": "ok", "phase": 7, "app": "clipcut-phase7",
                          "ffmpeg": ffmpeg_status(),
                          "youtube": youtube_runtime_diagnostics(),
+                         "live": live_worker_status(),
                          "auth": {"google_configured": google_oauth_configured()}})
 
 
@@ -359,6 +385,7 @@ def get_transcript_endpoint(upload_id: str) -> dict:
 
 @app.post("/find-clips")
 async def find_clips_endpoint(
+    request: Request,
     upload_id: str = Form(...),
     top_n: int | None = Form(default=None),  # None = Options default (2)
     style_name: str | None = Form(default=None),
@@ -424,12 +451,24 @@ async def find_clips_endpoint(
         raise HTTPException(
             status_code=400,
             detail="Transcript khaali hai — video me boli hui baat nahi mili, clips nahi ban sakte")
+    # Phase 6: the logged-in user's BYOK config drives the words
+    # judge (their provider/model/key); anonymous calls keep the
+    # legacy env-key behaviour. Ledger rows are written per user.
+    _user = _current_user(request)
+    ai_config = None
+    ledger_ctx = None
+    if _user is not None:
+        ai_config = get_effective_ai_config(DB_PATH, _user["id"])
+        ledger_ctx = {"db_path": DB_PATH, "user_id": _user["id"],
+                      "upload_id": upload_id,
+                      "creator_id": row.get("creator_id")}
     # Phase 3: pass the real video file so the Reaction judge can
     # measure loudness (without it the reaction score is neutral 50).
     result = find_clips(transcript, upload_id, top_n=opts["clip_count"],
                         style_name=style_name, options=opts,
                         language=language or transcript.get("language_requested") or "en",
-                        video_path=video_path)
+                        video_path=video_path, ai_config=ai_config,
+                        ledger_ctx=ledger_ctx)
     return {"message": "Clips ready.", "options": options_summary(opts), **result}
 
 
@@ -443,6 +482,7 @@ def get_clips_endpoint(upload_id: str) -> dict:
 
 @app.post("/render-clip")
 async def render_clip_endpoint(
+    request: Request,
     upload_id: str = Form(...),
     clip_id: str = Form(...),
     style_name: str = Form(default="global-baatien"),
@@ -457,10 +497,19 @@ async def render_clip_endpoint(
     Runs in a worker thread (asyncio.to_thread) — a ~47s clip takes
     1-3 min on CPU. Returns render metadata (paths, resolution,
     caption script, reframe mode, etc.).
+
+    Phase 6 hardening (Phase 5 flag): login + ownership required.
+    Without login -> 401; another user's upload -> 403. Ownerless
+    (legacy anonymous) uploads may be rendered by any logged-in user.
     """
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
     row = _get_upload_row(upload_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
     video_path = ROOT / row["stored_path"]
     if not video_path.is_file():
         raise HTTPException(status_code=404, detail="uploaded file missing on disk")
@@ -990,6 +1039,15 @@ def _app_layout(user: dict, active: str, body: str) -> HTMLResponse:
     used_mb = used / (1024 * 1024)
     pct = min(100, used / STORAGE_QUOTA_BYTES * 100) if STORAGE_QUOTA_BYTES else 0
     creators = list_creators(DB_PATH, user["id"])
+    # Phase 6: sidebar AI line shows real ledger counts (never breaks
+    # the layout if the ledger is unavailable).
+    try:
+        _tc = today_counts(DB_PATH, user["id"])
+        ai_calls, ai_tokens = _tc["calls_today"], _tc["tokens_today"]
+        ai_label = PROVIDERS[get_effective_ai_config(
+            DB_PATH, user["id"])["provider"]]["label"]
+    except Exception:
+        ai_calls, ai_tokens, ai_label = 0, 0, "Gemini"
 
     def nav(href: str, label: str, key: str) -> str:
         cls = "active" if active == key else ""
@@ -1018,7 +1076,8 @@ def _app_layout(user: dict, active: str, body: str) -> HTMLResponse:
             "<div class=\"muted\" style=\"margin-top:6px\">When your space is full, "
             "your oldest videos are deleted to make room. Download the clips "
             "you want to keep.</div></div>"
-            f"<div class=\"meter\">AI Gemini — 0 today<br><span class=\"muted\">"
+            f"<div class=\"meter\">AI {ai_label} — {ai_calls} today · "
+            f"{ai_tokens} tokens<br><span class=\"muted\">"
             f"{user['name']} · {user['email']}</span></div>"
             "</aside><main class=\"main\">" + body + "</main></div></body></html>")
     return HTMLResponse(html)
@@ -1051,6 +1110,22 @@ def _clips_files_for_user(user_id: str) -> list[dict]:
     return out
 
 
+def _live_status_label(st: dict) -> str:
+    """Human label for a creator's last live check (Phase 7)."""
+    s = (st.get("status") or "—")
+    if s == "live":
+        label = "🔴 LIVE" + (f" — {_html.escape(st['title'])}" if st.get("title") else "")
+    elif s == "offline":
+        label = "Offline"
+    elif s == "unknown":
+        label = "Unknown (check failed)"
+    else:
+        label = "—"
+    if st.get("checked_at"):
+        label += f" <span class=\"muted\">({str(st['checked_at'])[:16]})</span>"
+    return label
+
+
 def _dashboard_data(user: dict) -> dict:
     from datetime import date as _date, timedelta as _td
     today = _date.today()
@@ -1071,7 +1146,12 @@ def _dashboard_data(user: dict) -> dict:
         activity.append({"day": day.strftime("%b %d"), "clips": n, "posted": 0})
     return {"videos_today": videos_today, "videos_total": videos_total,
             "clips_today": clips_today, "clips_total": len(clips),
-            "activity": activity}
+            "activity": activity,
+            # Phase 7: real live-session counts (was hardcoded 0).
+            "recording_now": count_live_sessions(DB_PATH, user["id"]),
+            "live_sessions": [session_public(DB_PATH, s) for s in
+                              list_live_sessions(DB_PATH, user["id"])
+                              if s["status"] in ("live", "stopping")]}
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1198,6 +1278,17 @@ def dashboard(request: Request) -> HTMLResponse:
         return RedirectResponse("/login", status_code=303)
     data = _dashboard_data(user)
     creators = list_creators(DB_PATH, user["id"])
+    # Phase 6: dashboard AI card shows real ledger counts + provider.
+    try:
+        _tc = today_counts(DB_PATH, user["id"])
+        ai_calls_today, ai_tokens_today = _tc["calls_today"], _tc["tokens_today"]
+        _cfg = get_effective_ai_config(DB_PATH, user["id"])
+        ai_provider_label = PROVIDERS[_cfg["provider"]]["label"]
+        ai_model = _cfg["model"]
+        ai_has_key = bool(_cfg["has_key"])
+    except Exception:
+        ai_calls_today, ai_tokens_today = 0, 0
+        ai_provider_label, ai_model, ai_has_key = "Gemini", "gemini-2.0-flash", False
     max_clips = max([d["clips"] for d in data["activity"]] + [1])
     bars = "".join(
         f'<div class="bar" style="height:{(d["clips"] / max_clips * 88 + 2):.0f}px"'
@@ -1211,6 +1302,11 @@ def dashboard(request: Request) -> HTMLResponse:
         creator_rows = "".join(
             f"<tr><td>{c['name']}</td><td>{c['platform']}</td>"
             f"<td>{c['channel_link']}</td>"
+            f"<td><span data-live-cell=\"{c['id']}\">"
+            f"{_live_status_label(get_creator_live_status(DB_PATH, c['id']))}</span> "
+            f"<button type=\"button\" data-live-check=\"{c['id']}\" "
+            f"style=\"background:none;border:0;color:#93c5fd;cursor:pointer;padding:0\">"
+            f"Check</button></td>"
             f"<td><a href=\"/app/videos?creator={c['id']}\">Videos</a> · "
             f"<form method=\"post\" action=\"/app/creators/{c['id']}/delete\""
             f" style=\"display:inline\" onsubmit=\"return confirm("
@@ -1219,7 +1315,7 @@ def dashboard(request: Request) -> HTMLResponse:
             f"#f87171;cursor:pointer;padding:0\">Delete</button></form></td></tr>"
             for c in creators)
         creators_html = ("<table><tr><th>Name</th><th>Platform</th><th>Channel</th>"
-                         "<th></th></tr>" + creator_rows + "</table>")
+                         "<th>Live?</th><th></th></tr>" + creator_rows + "</table>")
     else:
         creators_html = ("<p class=\"muted\">No creators yet — Add one to give each "
                          "streamer their own workspace.</p>")
@@ -1242,6 +1338,23 @@ def dashboard(request: Request) -> HTMLResponse:
         f'{" checked" if k == "720p" else ""}> {v["label"]}'
         f' <span class="muted">— {v["note"]}</span></label>'
         for k, v in QUALITIES.items())
+    # Phase 7: live sessions card (real counts, not hardcoded 0).
+    if data["live_sessions"]:
+        live_rows = "".join(
+            f"<p>🔴 <a href=\"/app/live/{s['session_id']}\">"
+            f"{_html.escape(s['title'])}</a> — {s['chunks_done']} chunks done, "
+            f"{s['clips_count']} clips · {s['status']} · "
+            f"{int(s['total_duration_sec'] // 60)}:{int(s['total_duration_sec'] % 60):02d} min</p>"
+            for s in data["live_sessions"])
+        live_card = (f"<div class=\"card\"><h3>🔴 Recording now — "
+                     f"{data['recording_now']}</h3>{live_rows}"
+                     f"<a class=\"btn ghost\" href=\"/app/live\">All live sessions</a></div>")
+    else:
+        live_card = ("<div class=\"card\"><h3>🔴 Live recording</h3>"
+                     "<p class=\"muted\">No live session right now — apni camera ya "
+                     "screen record karo, har 60s ke chunk se clips live bante hain.</p>"
+                     "<a class=\"btn\" href=\"/live/record\">Record live</a> "
+                     "<a class=\"btn ghost\" href=\"/app/live\">All live sessions</a></div>")
     body = f"""
 <h1>Home</h1>
 <p class="muted">Good afternoon. {len(creators)} creator{'s' if len(creators) != 1 else ''}.</p>
@@ -1274,19 +1387,21 @@ def dashboard(request: Request) -> HTMLResponse:
 <button class="btn" type="submit">Make clips</button></form>
 <p id="yt-status" class="muted"></p></div>
 <div class="tiles">
-<div class="tile"><b>0</b><span>Recording now</span></div>
+<div class="tile"><b>{data['recording_now']}</b><span>Recording now</span></div>
 <div class="tile"><b>{data['clips_today']}</b><span>Clips today</span></div>
 <div class="tile"><b>0</b><span>Posted today</span></div>
 <div class="tile"><b>0</b><span>Waiting to post</span></div></div>
+{live_card}
 <div class="card"><h3>Activity — Last 14 days</h3>
 <p class="muted">{data['clips_total']} Clips made · 0 Posted · 0 Views · $0.00 Est. earnings</p>
 <div class="bar-row">{bars}</div>
 <div style="display:flex;gap:6px">{labels}</div>
 <p class="muted">Pink = Clips made · White = Posted</p></div>
-<div class="card"><h3>AI — Gemini</h3>
-<p class="muted">0 AI calls today · 0 Tokens today</p>
-<p class="muted">Per-call token ledger Phase 6 me aayega.</p>
-<a class="btn ghost" href="/app/usage">View usage</a></div>
+<div class="card"><h3>AI — {ai_provider_label}</h3>
+<p class="muted">{ai_calls_today} AI calls today · {ai_tokens_today} Tokens today
+({ai_model}{'' if ai_has_key else ' — no key, rule-based'})</p>
+<a class="btn ghost" href="/app/usage">View usage</a>
+<a class="btn ghost" href="/app/settings/ai">AI settings</a></div>
 <div class="card"><h3>Next steps — Finish setting up ClipCut</h3>
 <p>{step1} Add your first creator — Give each streamer their own workspace, settings and folder.</p>
 <p>{step2} Make your first clips — Paste a video link in the box above.</p>
@@ -1302,6 +1417,22 @@ def dashboard(request: Request) -> HTMLResponse:
 <p class="muted">Nothing queued or posted yet.</p>
 <button class="btn ghost" type="button" onclick="alert('Nothing queued — Pause all posting needs a queue first (Phase 8).')">Pause all posting</button></div>
 <script>
+document.querySelectorAll('[data-live-check]').forEach((btn) => {{
+  btn.addEventListener('click', async () => {{
+    const cid = btn.getAttribute('data-live-check');
+    const cell = document.querySelector('[data-live-cell="' + cid + '"]');
+    btn.textContent = 'Checking…';
+    try {{
+      const r = await fetch('/live/check', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{creator_id: cid}})}});
+      const j = await r.json();
+      if (!r.ok) {{ cell.textContent = 'Error: ' + (j.detail || 'check nahi hua'); }}
+      else if (j.live === true) {{ cell.textContent = '🔴 LIVE' + (j.title ? ' — ' + j.title : ''); }}
+      else if (j.live === false) {{ cell.textContent = 'Offline'; }}
+      else {{ cell.textContent = 'Unknown — ' + (j.error || 'pata nahi chala'); }}
+    }} catch (err) {{ cell.textContent = 'Error: ' + err; }}
+    btn.textContent = 'Check';
+  }});
+}});
 document.getElementById('yt-form').addEventListener('submit', async (e) => {{
   e.preventDefault();
   const url = document.getElementById('yt-url').value;
@@ -1351,7 +1482,11 @@ def all_videos(request: Request, creator: str | None = None) -> HTMLResponse:
             "SELECT id, user_id, creator_id FROM uploads").fetchall()}
     rows = []
     for p in projects:
-        uid, cid = owner.get(p["id"], (None, None))
+        # Phase 7 fix (pre-existing bug): get_project_status() returns
+        # "upload_id", not "id" — /app/videos 500'd (KeyError) for ANY
+        # project, live sessions included. Found by the Phase 7 test.
+        pid = p["upload_id"]
+        uid, cid = owner.get(pid, (None, None))
         if uid != user["id"]:
             continue
         if creator and cid != creator:
@@ -1360,17 +1495,18 @@ def all_videos(request: Request, creator: str | None = None) -> HTMLResponse:
     if rows:
         body_rows = ""
         for p in rows:
+            pid = p["upload_id"]
             # Phase 5: clips with scores, each linking to its editor.
             try:
-                clips = load_clips(p["id"]).get("clips", [])
+                clips = load_clips(pid).get("clips", [])
             except FileNotFoundError:
                 clips = []
             clip_links = " · ".join(
-                f"<a href=\"/app/videos/{p['id']}/clips/{c['clip_id']}\">"
+                f"<a href=\"/app/videos/{pid}/clips/{c['clip_id']}\">"
                 f"{c['clip_id']} ({_fmt_score(c.get('combined_score', c.get('score')))})</a>"
                 for c in clips) or "<span class=\"muted\">koi clip nahi</span>"
             body_rows += (
-                f"<tr><td><a href=\"/app/videos/{p['id']}\">{p.get('id','')[:8]}…</a></td>"
+                f"<tr><td><a href=\"/app/videos/{pid}\">{pid[:8]}…</a></td>"
                 f"<td>{p.get('status','')}</td><td>{clip_links}</td></tr>")
         table = ("<table><tr><th>Video</th><th>Status</th><th>Clips (score)</th></tr>"
                  + body_rows + "</table>")
@@ -1803,6 +1939,13 @@ async def remake_clip_endpoint(request: Request):
     row = _get_upload_row(upload_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"upload not found: {upload_id}")
+    # Phase 6 hardening (Phase 5 flag): login + ownership required,
+    # same rule as /render-clip (401 unauth, 403 other user's video).
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    if not _owns_upload(request, upload_id):
+        raise HTTPException(status_code=403, detail="Ye video tumhari nahi hai")
     video_path = ROOT / row["stored_path"]
     if not video_path.is_file():
         raise HTTPException(status_code=404, detail="uploaded file missing on disk")
@@ -1896,6 +2039,23 @@ async def hand_clip_endpoint(request: Request):
             language=transcript.get("language_requested") or "en")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Phase 6 ledger: hand clips get a "hand clip" row (0 tokens —
+    # the scores are informational rule-based/loudness scores, and
+    # the hook/title are the user's own words, not an LLM call).
+    # Only logged-in users get a row (anonymous calls stay anonymous).
+    try:
+        _hand_user = _current_user(request)
+        if _hand_user is not None:
+            log_ai_call(DB_PATH, _hand_user["id"], "hand clip",
+                        provider="—", model="—", upload_id=upload_id,
+                        creator_id=row.get("creator_id"),
+                        method="rule_based", status="ok",
+                        note=(f"hand clip {clip.get('clip_id')} "
+                              f"{start}s–{end}s, words "
+                              f"{clip.get('words_score')}, reaction "
+                              f"{clip.get('reaction_score')}"))
+    except Exception:
+        pass
     return {"message": "Hand clip ban gaya — AI gate nahi lagaya gaya.",
             **clip}
 
@@ -1940,19 +2100,73 @@ def download_version_caption_endpoint(upload_id: str, clip_id: str, version: int
 
 @app.get("/app/usage", response_class=HTMLResponse)
 def ai_usage(request: Request) -> HTMLResponse:
+    """AI usage ledger — every AI call, with tokens. Last 30 days."""
     user = _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    body = """<h1>AI usage</h1>
+    s = usage_summary(DB_PATH, user["id"], days=30)
+    max_day_tokens = max([d["tokens"] for d in s["per_day"]] + [1])
+    day_bars = "".join(
+        f'<div class="bar" style="height:{(d["tokens"] / max_day_tokens * 88 + 2):.0f}px"'
+        f' title="{d["day"]}: {d["tokens"]} tokens, {d["calls"]} calls"></div>'
+        for d in s["per_day"])
+    day_labels = "".join(
+        f"<span style=\"flex:1;font-size:10px;color:#a5b4fc\">"
+        f"{d['day'][5:]}</span>" for d in s["per_day"][::7])
+    if s["by_purpose"]:
+        purpose_rows = "".join(
+            f"<tr><td>{_html.escape(str(p['purpose']))}</td>"
+            f"<td>{p['calls']}</td><td>{p['tokens']}</td></tr>"
+            for p in s["by_purpose"])
+        purpose_html = ("<table><tr><th>Used for</th><th>Calls</th>"
+                        "<th>Tokens</th></tr>" + purpose_rows + "</table>")
+    else:
+        purpose_html = "<p class=\"muted\">No AI usage in this period yet.</p>"
+    if s["by_creator"]:
+        creator_rows = "".join(
+            f"<tr><td>{_html.escape(str(c['name']))}</td>"
+            f"<td>{c['calls']}</td><td>{c['tokens']}</td></tr>"
+            for c in s["by_creator"])
+        creator_html = ("<table><tr><th>Creator</th><th>Calls</th>"
+                        "<th>Tokens</th></tr>" + creator_rows + "</table>")
+    else:
+        creator_html = "<p class=\"muted\">No AI usage in this period yet.</p>"
+    if s["recent"]:
+        recent_rows = "".join(
+            f"<tr><td>{_html.escape(str(r['created_at'][:16]).replace('T', ' '))}</td>"
+            f"<td>{_html.escape(str(r['purpose']))}</td>"
+            f"<td>{_html.escape(str(r['provider'] or '—'))}"
+            f"{(' / ' + _html.escape(str(r['model']))) if r['model'] else ''}</td>"
+            f"<td>{_html.escape(str(r['upload_name']))}</td>"
+            f"<td>{_html.escape(str(r['creator_name']))}</td>"
+            f"<td>{r['total_tokens']}"
+            f"{' (est.)' if r['token_source'] == 'estimated' else ''}</td>"
+            f"<td>{_html.escape(str(r['method']))}</td>"
+            f"<td>{_html.escape(str(r['status']))}</td></tr>"
+            for r in s["recent"])
+        recent_html = ("<table><tr><th>When</th><th>Used for</th>"
+                       "<th>Provider / model</th><th>Video</th><th>Creator</th>"
+                       "<th>Tokens</th><th>Method</th><th>Status</th></tr>"
+                       + recent_rows + "</table>"
+                       + "<p class=\"muted\">\"(est.)\" = provider ne usage "
+                         "nahi diya, tokens estimate hain. \"finding clips\" "
+                         "rows carry 0 tokens by design — unke tokens "
+                         "\"words judge\" row par hain, taaki total "
+                         "double-count na ho.</p>")
+    else:
+        recent_html = "<p class=\"muted\">No AI usage in this period yet.</p>"
+    body = f"""<h1>AI usage</h1>
 <p class="muted">Every AI call ClipCut makes, and the tokens it uses. Last 30 days.</p>
-<div class="tiles"><div class="tile"><b>0</b><span>AI calls</span></div>
-<div class="tile"><b>0</b><span>Tokens</span></div>
-<div class="tile"><b>0</b><span>Input tokens</span></div>
-<div class="tile"><b>0</b><span>Output tokens</span></div></div>
-<div class="card"><h3>Recent AI activity</h3>
-<p class="muted">No AI usage in this period yet.</p>
-<p class="muted">Per-call ledger (finding clips / words judge / reaction judge /
-title+hook, with creator, video and tokens) Phase 6 me aayega.</p></div>"""
+<div class="tiles"><div class="tile"><b>{s['calls']}</b><span>AI calls</span></div>
+<div class="tile"><b>{s['tokens']}</b><span>Tokens</span></div>
+<div class="tile"><b>{s['input_tokens']}</b><span>Input tokens</span></div>
+<div class="tile"><b>{s['output_tokens']}</b><span>Output tokens</span></div></div>
+<div class="card"><h3>Tokens per day — Last 30 days</h3>
+<div class="bar-row">{day_bars}</div>
+<div style="display:flex;gap:6px">{day_labels}</div></div>
+<div class="card"><h3>What it was used for</h3>{purpose_html}</div>
+<div class="card"><h3>By creator</h3>{creator_html}</div>
+<div class="card"><h3>Recent AI activity — Latest {len(s['recent'])} calls</h3>{recent_html}</div>"""
     return _app_layout(user, "AI usage", body)
 
 
@@ -2060,15 +2274,131 @@ def connected_apps(request: Request) -> HTMLResponse:
 
 @app.get("/app/settings/ai", response_class=HTMLResponse)
 def ai_settings(request: Request) -> HTMLResponse:
+    """Settings/AI — BYOK: provider, model, per-account key (masked)."""
     user = _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    body = """<h1>AI settings</h1><div class="card">
+    saved = get_ai_settings(DB_PATH, user["id"])
+    cfg = get_effective_ai_config(DB_PATH, user["id"])
+    err = request.query_params.get("error", "")
+    saved_flag = request.query_params.get("saved", "") == "1"
+    provider = saved["provider"] if saved else "gemini"
+    model = saved["model"] if saved else PROVIDERS["gemini"]["default_model"]
+    custom_url = saved["custom_base_url"] if saved else ""
+    if saved and saved["has_key"]:
+        key_line = (f"Saved, ends in <b>{_html.escape(saved['key_last4'])}</b> — "
+                    "paste a new key to replace it. Full key kabhi dikhayi nahi jati.")
+    else:
+        key_line = ("No key saved — fresh account par koi key pre-filled "
+                    "nahi hoti. Key ke bina rule-based scoring chalega.")
+    status = (f"Ready — {PROVIDERS[cfg['provider']]['label']} / "
+              f"{_html.escape(cfg['model'])} "
+              f"({'key saved' if cfg['has_key'] else 'no key — rule-based'})")
+    radios = "".join(
+        f'<label><input type="radio" name="provider" value="{pid}"'
+        f'{" checked" if pid == provider else ""}> <b>{info["label"]}</b> '
+        f'<span class="muted">— {info["note"]}</span></label>'
+        for pid, info in PROVIDERS.items())
+    err_html = f'<p class="err">{_html.escape(err)}</p>' if err else ""
+    saved_html = ('<p style="color:#4ade80">Saved.</p>'
+                  if saved_flag else "")
+    body = f"""<h1>AI settings</h1><div class="card">
 <p class="muted">The AI that finds the moments and writes the hooks. Bring your own key. Nothing here is shared.</p>
-<p>Status: <b>Ready</b> (Gemini — free key from environment, Phase 2 rescore only)</p>
-<p class="muted">Provider choice (Gemini / OpenAI / Grok / Groq / OpenRouter / Claude / Ollama / Custom),
-model picker and per-account key storage — Phase 6 me aayega. Keys kabhi chat ya file me mat likhna.</p></div>"""
+<p>Status: <b>{status}</b></p>{err_html}{saved_html}
+<form method="post" action="/app/settings/ai">
+<label style="display:block;font-weight:700">Provider</label>
+<div class="radio">{radios}</div>
+<label>Model<input name="model" value="{_html.escape(model)}" required>
+<span class="muted">Apne provider ka model id — "Find models" se list bhi le sakte ho (key chahiye, Claude ko chhod kar).</span></label>
+<button class="btn ghost" type="button" id="find-models">Find models</button>
+<p id="models-msg" class="muted"></p>
+<label>Custom base URL (Custom provider ke liye)<input name="custom_base_url" value="{_html.escape(custom_url)}" placeholder="https://your-endpoint/v1"></label>
+<label>API key<input name="api_key" type="password" autocomplete="off" placeholder="Paste your key — khaali chhodo to purani key rehti hai">
+<span class="muted">{key_line}</span></label>
+<button class="btn" type="submit">Save AI settings</button></form>
+<form method="post" action="/app/settings/ai/remove-key" style="margin-top:10px"
+onsubmit="return confirm('Saved key hata di jaye? Rule-based scoring chalega.');">
+<button class="btn ghost" type="submit">Remove saved key</button></form>
+<p class="muted">Key server par encrypted save hoti hai (Fernet, server secret se) — database
+mein kabhi plaintext nahi rehti. Key kabhi chat ya file me mat likhna.</p></div>
+<div class="card"><h3>Provider status</h3>
+<p class="muted">Gemini: works. OpenAI / Grok / Groq / OpenRouter / Custom:
+OpenAI-compatible adapter implemented, live-untested (koi key nahi hai).
+Claude: messages API implemented, live-untested, no list-models API.
+Ollama: local only, is machine par Ollama nahi chal raha (untested).</p></div>
+<script>
+document.getElementById('find-models').addEventListener('click', async () => {{
+  const msg = document.getElementById('models-msg');
+  const prov = (document.querySelector('input[name="provider"]:checked') || {{}}).value || 'gemini';
+  msg.textContent = 'Models dhoondh raha hoon…';
+  try {{
+    const r = await fetch('/app/settings/ai/models?provider=' + encodeURIComponent(prov));
+    const j = await r.json();
+    if (!r.ok) {{ msg.textContent = 'Error: ' + (j.detail || 'list nahi mili'); return; }}
+    if (j.models && j.models.length) {{
+      msg.textContent = j.message + ': ' + j.models.slice(0, 20).join(', ');
+    }} else {{ msg.textContent = j.message || 'Koi model nahi mila.'; }}
+  }} catch (err) {{ msg.textContent = 'Error: ' + err; }}
+}});
+</script>"""
     return _app_layout(user, "Settings", body)
+
+
+@app.post("/app/settings/ai")
+def ai_settings_save(request: Request, provider: str = Form(...),
+                     model: str = Form(default=""),
+                     api_key: str = Form(default=""),
+                     custom_base_url: str = Form(default="")):
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        save_ai_settings(DB_PATH, user["id"], provider, model=model,
+                         api_key=api_key or None,
+                         custom_base_url=custom_base_url or None)
+    except ValueError as exc:
+        from urllib.parse import quote as _q
+        return RedirectResponse(f"/app/settings/ai?error={_q(str(exc))}",
+                                status_code=303)
+    return RedirectResponse("/app/settings/ai?saved=1", status_code=303)
+
+
+@app.post("/app/settings/ai/remove-key")
+def ai_settings_remove_key(request: Request):
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    clear_ai_key(DB_PATH, user["id"])
+    return RedirectResponse("/app/settings/ai?saved=1", status_code=303)
+
+
+@app.get("/app/settings/ai/models")
+def ai_models_list(request: Request, provider: str = "") -> dict:
+    """'Find models' — real provider list, never a fake one.
+
+    Uses the saved key for that provider when one exists (else the
+    env Gemini key for gemini, else no key). Claude has no list API
+    and Ollama needs a local server — both say so plainly.
+    """
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login karo — /login kholo")
+    provider = (provider or "gemini").strip().lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+    saved = get_ai_settings(DB_PATH, user["id"])
+    if saved and saved["provider"] == provider:
+        cfg = get_effective_ai_config(DB_PATH, user["id"])
+    elif provider == "gemini":
+        cfg = get_effective_ai_config(DB_PATH, None)
+    else:
+        cfg = {"provider": provider,
+               "model": PROVIDERS[provider]["default_model"],
+               "api_key": None,
+               "base_url": PROVIDERS[provider].get("base_url") or "",
+               "source": "none", "has_key": False}
+    models, message = list_models_for_provider(cfg)
+    return {"provider": provider, "models": models, "message": message}
 
 
 @app.post("/app/creators")
@@ -2159,6 +2489,426 @@ def get_youtube_job_endpoint(job_id: str) -> dict:
         return get_youtube_job(job_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ---------------------------------------------------------- Phase 7: live recorder
+
+def _live_record_body(creators: list[dict]) -> str:
+    """The 'Record live' page. Plain string (not an f-string) so the
+    inline JS braces need no escaping; only {CREATOR_OPTIONS} is
+    substituted. MediaRecorder segments are made by STOP/START every
+    60s (not timeslice blobs) — only that way is each chunk a
+    self-contained playable file the server can ffprobe."""
+    creator_options = "".join(
+        f'<option value="{c["id"]}">{_html.escape(c["name"])}</option>'
+        for c in creators)
+    return """
+<h1>🔴 Record live</h1>
+<p class="muted">Apni camera/mic ya screen record karo — har 60 second ka chunk
+server par jaata hai, transcribe hota hai, dual-judge se score hota hai aur
+captioned clip ban jaata hai — <b>session khatam hone se pehle</b>. Stop dabate
+hi saare chunks ek video me jud jaate hain.</p>
+<div class="card"><h3>Start a live session</h3>
+<label>Title<input id="live-title" type="text" placeholder="e.g. Friday live stream"></label>
+<div style="display:flex;gap:10px">
+<label style="flex:1">Creator
+<select id="live-creator"><option value="">No creator</option>{CREATOR_OPTIONS}</select></label>
+<label style="flex:1">Source
+<select id="live-source"><option value="camera">Camera + mic</option><option value="screen">Screen (+ tab audio, Chrome)</option></select></label></div>
+<div style="display:flex;gap:10px">
+<label style="flex:1">How many clips per chunk?
+<input id="live-count" type="number" min="1" max="8" value="2"></label>
+<label style="flex:1">Caption style
+<select id="live-caption"><option value="bounce">Bounce (yellow)</option><option value="hype">Hype (pink)</option><option value="clean">Clean (white)</option></select></label>
+<label style="flex:1">Quality
+<select id="live-quality"><option value="720p">720p (fast)</option><option value="1080p">1080p (slower)</option></select></label></div>
+<p class="muted">Har segment ~60s ka hota hai; segments ke beech ~0.2s ka chhota gap
+reh sakta hai (MediaRecorder stop/start). Ek chunk ek baar me process hota hai —
+Render Free 512 MB par yahi safe hai, isliye clips thode peeche reh sakte hain.</p>
+<p id="live-error" class="err"></p>
+<button class="btn" id="live-start" type="button">Start recording</button>
+<button class="btn ghost" id="live-stop" type="button" disabled>Stop &amp; finalise</button>
+<a class="btn ghost" href="/app/live">All live sessions</a></div>
+<div class="card"><h3>Session status</h3>
+<p id="live-status" class="muted">Not recording.</p>
+<p id="live-clips" class="muted"></p>
+<video id="live-preview" autoplay muted playsinline style="width:100%;max-width:480px;border-radius:8px;background:#000"></video></div>
+<script>
+let liveStream = null, liveRecorder = null, liveSession = null;
+let liveStill = false, liveSegTimer = null, livePollTimer = null;
+let liveChunksSent = 0, liveStartedAt = 0;
+const $ = (id) => document.getElementById(id);
+function pickMime() {
+  const cands = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm',''];
+  for (const m of cands) { if (!m || MediaRecorder.isTypeSupported(m)) return m; }
+  return '';
+}
+async function uploadChunk(blob) {
+  const fd = new FormData();
+  fd.append('chunk', blob, 'chunk.webm');
+  const r = await fetch('/live/' + liveSession + '/chunk', {method:'POST', body: fd});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || 'chunk upload nahi hua');
+  liveChunksSent++;
+  $('live-status').textContent = 'Recording… ' + liveChunksSent + ' chunk(s) sent · ' +
+    Math.floor((Date.now() - liveStartedAt) / 1000) + 's elapsed';
+}
+function startSegment() {
+  if (!liveStill) return;
+  liveRecorder = new MediaRecorder(liveStream, {mimeType: pickMime()});
+  liveRecorder.ondataavailable = async (e) => {
+    if (e.data && e.data.size > 0) {
+      try { await uploadChunk(e.data); }
+      catch (err) { $('live-error').textContent = 'Chunk error: ' + err; }
+    }
+  };
+  liveRecorder.onstop = () => {
+    clearTimeout(liveSegTimer);
+    if (liveStill) startSegment();  // next 60s segment
+  };
+  liveRecorder.start();
+  liveSegTimer = setTimeout(() => {
+    if (liveRecorder && liveRecorder.state === 'recording') liveRecorder.stop();
+  }, 60000);
+}
+async function pollSession() {
+  if (!liveSession) return;
+  try {
+    const r = await fetch('/live/' + liveSession);
+    const j = await r.json();
+    if (r.ok) {
+      $('live-clips').textContent = j.chunks_done + ' chunk(s) processed · ' +
+        j.clips_count + ' clip(s) ready — ' +
+        j.clips.map(c => c.clip_id + ' (' + (c.score ?? '?') + ')').join(', ');
+    }
+  } catch (e) {}
+}
+$('live-start').addEventListener('click', async () => {
+  $('live-error').textContent = '';
+  const title = $('live-title').value || 'Live recording';
+  const creatorId = $('live-creator').value || null;
+  const source = $('live-source').value;
+  const options = {
+    clip_count: Number($('live-count').value) || 2,
+    min_sec: 15, max_sec: 60,
+    caption_style: $('live-caption').value || 'bounce',
+    layout: 'blurred_fill', quality: $('live-quality').value || '720p',
+    video_type: 'auto', from_min: null, to_min: null,
+  };
+  try {
+    const r = await fetch('/live/start', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({title, creator_id: creatorId, options, language:'en'})});
+    const j = await r.json();
+    if (!r.ok) { $('live-error').textContent = 'Error: ' + (j.detail || 'session start nahi hui'); return; }
+    liveSession = j.session_id;
+    if (source === 'screen') {
+      liveStream = await navigator.mediaDevices.getDisplayMedia({video:true, audio:true});
+    } else {
+      liveStream = await navigator.mediaDevices.getUserMedia({video:true, audio:true});
+    }
+    $('live-preview').srcObject = liveStream;
+    liveStill = true; liveChunksSent = 0; liveStartedAt = Date.now();
+    $('live-start').disabled = true; $('live-stop').disabled = false;
+    $('live-status').textContent = 'Recording… session ' + liveSession;
+    startSegment();
+    livePollTimer = setInterval(pollSession, 10000);
+  } catch (err) {
+    $('live-error').textContent = 'Error: ' + err;
+  }
+});
+$('live-stop').addEventListener('click', async () => {
+  liveStill = false;
+  clearTimeout(liveSegTimer); clearInterval(livePollTimer);
+  try { if (liveRecorder && liveRecorder.state === 'recording') liveRecorder.stop(); } catch (e) {}
+  if (liveStream) liveStream.getTracks().forEach(t => t.stop());
+  if (!liveSession) return;
+  $('live-status').textContent = 'Finalising… chunks jud rahe hain, thoda time lagega.';
+  const r = await fetch('/live/' + liveSession + '/stop', {method:'POST'});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { $('live-error').textContent = 'Error: ' + (j.detail || 'stop nahi hua'); return; }
+  window.location.href = '/app/live/' + liveSession;
+});
+</script>
+""".replace("{CREATOR_OPTIONS}", creator_options)
+
+
+@app.get("/live/record", response_class=HTMLResponse)
+def live_record_page(request: Request) -> HTMLResponse:
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    creators = list_creators(DB_PATH, user["id"])
+    return _app_layout(user, "Record live", _live_record_body(creators))
+
+
+@app.post("/live/start")
+async def live_start_endpoint(request: Request):
+    """Start a browser-capture live session (login required)."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Pehle sign in karo")
+    body = await _read_body(request)
+    raw_options = body.get("options") or {}
+    if not isinstance(raw_options, dict):
+        raise HTTPException(status_code=400, detail="options ek object hona chahiye")
+    try:
+        opts = parse_options(raw_options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    creator_id = body.get("creator_id") or None
+    if creator_id:
+        creator = get_creator(DB_PATH, str(creator_id))
+        if not creator or creator["user_id"] != user["id"]:
+            raise HTTPException(status_code=400, detail="Creator nahi mila — dobara choose karo")
+    try:
+        session = create_live_session(
+            DB_PATH, ROOT, user["id"],
+            title=str(body.get("title") or "Live recording"),
+            creator_id=str(creator_id) if creator_id else None,
+            source="browser", options=opts,
+            language=str(body.get("language") or "en"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"session_id": session["session_id"],
+            "upload_id": session["upload_id"], "status": "live",
+            "message": "Live session shuru — ab browser se 60s ke chunks bhejo"}
+
+
+@app.post("/live/{session_id}/chunk")
+async def live_chunk_endpoint(request: Request, session_id: str,
+                              chunk: UploadFile = File(...)):
+    """One self-contained chunk file for a live session.
+
+    Login required; only the session owner, while the session is
+    live, can upload. The file is streamed to disk (no in-memory
+    buffering) and queued for the single worker thread."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Pehle sign in karo")
+    session = get_live_session(DB_PATH, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Live session nahi mila")
+    if session["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Ye session tumhara nahi hai")
+    if session["status"] != "live":
+        raise HTTPException(status_code=400,
+                            detail=f"Session {session['status']} hai — chunk sirf live session me aata hai")
+    ext = Path(chunk.filename or "").suffix.lower()
+    if ext not in {".webm", ".mp4", ".mov", ".mkv"}:
+        raise HTTPException(status_code=400,
+                            detail="Chunk .webm, .mp4, .mov ya .mkv hona chahiye")
+    session_dir = ROOT / "uploads" / "live" / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = session_dir / f"incoming_{uuid.uuid4().hex[:12]}{ext}"
+    try:
+        import shutil as _shutil
+        with raw_path.open("wb") as f:
+            _shutil.copyfileobj(chunk.file, f, length=1024 * 1024)
+    finally:
+        try:
+            await chunk.close()
+        except Exception:
+            pass
+    try:
+        result = register_chunk(DB_PATH, ROOT, session_id, raw_path)
+    except (ValueError, FileNotFoundError) as exc:
+        try:
+            raw_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=str(exc))
+    return result
+
+
+@app.post("/live/{session_id}/stop")
+def live_stop_endpoint(request: Request, session_id: str) -> dict:
+    """Stop a session: no more chunks; finalise in the background."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Pehle sign in karo")
+    try:
+        session = stop_live_session(DB_PATH, ROOT, session_id, user["id"])
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return session_public(DB_PATH, session)
+
+
+@app.get("/live/{session_id}")
+def live_status_endpoint(request: Request, session_id: str) -> dict:
+    """Live status: chunks received/processing/done + clips so far."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Pehle sign in karo")
+    session = get_live_session(DB_PATH, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Live session nahi mila")
+    if session["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Ye session tumhara nahi hai")
+    return session_public(DB_PATH, session)
+
+
+@app.get("/live")
+def live_list_endpoint(request: Request) -> dict:
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Pehle sign in karo")
+    sessions = list_live_sessions(DB_PATH, user["id"])
+    return {"sessions": [session_public(DB_PATH, s) for s in sessions]}
+
+
+@app.post("/live/check")
+async def live_check_endpoint(request: Request):
+    """Is a creator's channel live right now? yt-dlp only, no keys.
+
+    Body: {"creator_id": "..."} or {"channel_link": "..."}.
+    Returns {"platform", "live": true|false|null, "title", "error"} —
+    live=null means "pata nahi chala", never a guess. The result is
+    stored on the creator row (best-effort) when creator_id is given."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Pehle sign in karo")
+    body = await _read_body(request)
+    creator_id = body.get("creator_id") or None
+    link = ""
+    if creator_id:
+        creator = get_creator(DB_PATH, str(creator_id))
+        if not creator or creator["user_id"] != user["id"]:
+            raise HTTPException(status_code=400, detail="Creator nahi mila — dobara choose karo")
+        link = creator["channel_link"]
+    else:
+        link = str(body.get("channel_link") or "")
+    if not link:
+        raise HTTPException(status_code=400, detail="channel_link ya creator_id do")
+    result = check_channel_live(link)
+    if creator_id:
+        try:
+            record_channel_check(DB_PATH, str(creator_id), result)
+        except Exception:
+            pass
+    return result
+
+
+@app.post("/live/start-from-url")
+async def live_start_from_url_endpoint(request: Request):
+    """Record a stream/VOD URL with yt-dlp (best-effort, background).
+
+    Body: {"url", "title"?, "creator_id"?, "options"?, "language"?}.
+    The live check is NOT a gate — a URL yt-dlp cannot read fails
+    honestly in the session's error field. No API keys are used."""
+    user = _require_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Pehle sign in karo")
+    body = await _read_body(request)
+    url = str(body.get("url") or "")
+    raw_options = body.get("options") or {}
+    if not isinstance(raw_options, dict):
+        raise HTTPException(status_code=400, detail="options ek object hona chahiye")
+    try:
+        opts = parse_options(raw_options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    creator_id = body.get("creator_id") or None
+    if creator_id:
+        creator = get_creator(DB_PATH, str(creator_id))
+        if not creator or creator["user_id"] != user["id"]:
+            raise HTTPException(status_code=400, detail="Creator nahi mila — dobara choose karo")
+    try:
+        session = start_url_session(
+            DB_PATH, ROOT, user["id"], url,
+            title=str(body.get("title") or ""),
+            creator_id=str(creator_id) if creator_id else None,
+            options=opts, language=str(body.get("language") or "en"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"session_id": session["session_id"],
+            "upload_id": session["upload_id"], "status": "live",
+            "source": "url",
+            "message": "URL capture shuru — yt-dlp stream download kar raha hai; "
+                       "Stop dabate hi capture band hoga aur clips banenge"}
+
+
+@app.get("/app/live", response_class=HTMLResponse)
+def live_list_page(request: Request) -> HTMLResponse:
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    sessions = list_live_sessions(DB_PATH, user["id"])
+    if sessions:
+        rows = "".join(
+            f"<tr><td><a href=\"/app/live/{s['session_id']}\">"
+            f"{_html.escape(s['title'])}</a></td>"
+            f"<td>{s['source']}</td><td>{s['status']}</td>"
+            f"<td>{s['chunks_count']}</td><td>{s['clips_count']}</td>"
+            f"<td>{int(s['total_duration_sec'] // 60)}:"
+            f"{int(s['total_duration_sec'] % 60):02d} min</td>"
+            f"<td>{str(s['created_at'])[:16]}</td></tr>" for s in sessions)
+        table = ("<table><tr><th>Session</th><th>Source</th><th>Status</th>"
+                 "<th>Chunks</th><th>Clips</th><th>Length</th><th>Started</th></tr>"
+                 + rows + "</table>")
+    else:
+        table = "<p class=\"muted\">No live sessions yet.</p>"
+    body = (f"<h1>Live sessions</h1><div class=\"card\">{table}</div>"
+            f"<p><a class=\"btn\" href=\"/live/record\">🔴 Record live</a> "
+            f"<a class=\"btn ghost\" href=\"/app\">Back to Home</a></p>")
+    return _app_layout(user, "Live sessions", body)
+
+
+@app.get("/app/live/{session_id}", response_class=HTMLResponse)
+def live_detail_page(request: Request, session_id: str) -> HTMLResponse:
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    session = get_live_session(DB_PATH, session_id)
+    if not session or session["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Live session nahi mila")
+    pub = session_public(DB_PATH, session)
+    chunk_rows = "".join(
+        f"<tr><td>#{c['chunk_index']}</td><td>{c['start_sec']}s</td>"
+        f"<td>{c['duration_sec']}s</td><td>{c['status']}</td>"
+        f"<td>{_html.escape(c.get('note') or c.get('error') or '')}</td></tr>"
+        for c in pub["chunks"]) or "<tr><td colspan=\"5\">No chunks yet.</td></tr>"
+    clip_links = " · ".join(
+        f"<a href=\"/app/videos/{pub['upload_id']}/clips/{c['clip_id']}\">"
+        f"{c['clip_id']} ({_fmt_score(c.get('score'))})</a>"
+        for c in pub["clips"]) or "<span class=\"muted\">No clips yet — chunks process hote hi yahan aayenge.</span>"
+    stop_btn = ""
+    if pub["status"] == "live":
+        stop_btn = (f"<button class=\"btn\" id=\"live-stop-btn\" type=\"button\">"
+                    f"Stop &amp; finalise</button> "
+                    f"<script>document.getElementById('live-stop-btn')"
+                    f".addEventListener('click', async () => {{"
+                    f"const r = await fetch('/live/{session_id}/stop', {{method:'POST'}});"
+                    f"if (r.ok) location.reload();"
+                    f"else alert('Stop nahi hua: ' + (await r.json()).detail);}});</script>")
+    video_link = ""
+    if pub["status"] in ("stopped", "failed"):
+        video_link = (f"<p><a class=\"btn\" href=\"/app/videos/{pub['upload_id']}\">"
+                      f"Open final video</a></p>")
+    err = (f"<p class=\"err\">{_html.escape(pub['error'])}</p>"
+           if pub.get("error") else "")
+    note = (f"<p class=\"muted\">{_html.escape(pub['note'])}</p>"
+            if pub.get("note") else "")
+    body = (f"<h1>🔴 {_html.escape(pub['title'])}</h1>"
+            f"<p class=\"muted\">Source: {pub['source']}"
+            f"{' — ' + _html.escape(pub['source_url']) if pub['source_url'] else ''}"
+            f" · Status: <b>{pub['status']}</b> · Started {str(pub['created_at'])[:16]}</p>"
+            f"<div class=\"card\"><h3>Progress</h3>"
+            f"<p>{pub['chunks_done']} chunk(s) done · {pub['chunks_received']} received · "
+            f"{pub['chunks_processing']} processing · {pub['chunks_error']} error · "
+            f"{pub['clips_count']} clip(s) · {pub['total_duration_sec']}s total</p>"
+            f"{err}{note}{stop_btn}{video_link}</div>"
+            f"<div class=\"card\"><h3>Clips (live bante hue)</h3><p>{clip_links}</p></div>"
+            f"<div class=\"card\"><h3>Chunks</h3><table>"
+            f"<tr><th>#</th><th>Start</th><th>Length</th><th>Status</th><th>Note</th></tr>"
+            f"{chunk_rows}</table></div>"
+            f"<p><a class=\"btn ghost\" href=\"/app/live\">All live sessions</a> "
+            f"<a class=\"btn ghost\" href=\"/app\">Back to Home</a></p>")
+    return _app_layout(user, "Live session", body)
 
 
 def run() -> None:

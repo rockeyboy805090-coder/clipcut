@@ -144,14 +144,96 @@ Two judges must AGREE before a clip is kept (CreativeCut rule):
 - Render still works end-to-end with the new scoring: clip_01
   720p/Clean, 720x1280 h264 yuv420p 30fps, 42.67s, render `score`
   field = 66 (combined).
-- Still NOT done: Phase 5 clip editor, Phase 6 BYOK ledger, Phase 7
-  live recorder, Phase 8 posting queue, Phase 10 deploy.
+- Still NOT done at the time Phase 3 was written: Phase 5 clip editor,
+  Phase 6 BYOK ledger, Phase 7 live recorder, Phase 8 posting queue,
+  Phase 10 deploy. (Phases 5 and 6 are done now — see below.)
 
-## Not done yet (Phases 5–10, see CLONE_PLAN.md §4)
+## Phase 6 (16 Nov 2026) — BYOK + token ledger (TEST-PASS, local real runs)
 
-Phase 5 clip editor (trim/hook/re-make) · Phase 6 BYOK + token ledger ·
-Phase 7 live recorder · Phase 8 posting queue · Phase 9 upgrades ·
-Phase 10 polish + landing + legal pages + deploy.
+`ai_providers.py` + `ai_ledger.py` (NEW), report: `../PHASE6_REPORT.md`.
+- **Settings/AI page** (`/app/settings/ai`): 8 providers — Gemini
+  (default, gemini-2.0-flash), OpenAI, Grok, Groq, OpenRouter, Claude,
+  Ollama (local), Custom (OpenAI-compatible, base URL required).
+  Model field + "Find models" (real provider list via API; Claude has
+  no list API and says so; no key -> clear message, never a fake list).
+- **Key storage:** per-user, Fernet-encrypted at rest (PBKDF2 key
+  from `CLIPCUT_KEY_SECRET` env, else a generated `.clipcut_key_secret`
+  file, 0600, gitignored). UI only ever shows "Saved, ends in XXXX";
+  a fresh account shows NO saved key (unlike the reference app).
+  Empty key field keeps the old key; "Remove saved key" clears it.
+- **Words judge drives the chosen provider:** Gemini via
+  google-generativeai (usage from `usage_metadata` when reported);
+  OpenAI/Grok/Groq/OpenRouter/Custom via `/chat/completions`; Claude
+  via Messages API; Ollama via local `/api/chat`. No key / any API
+  failure -> rule-based fallback, ledger says so (method rule_based).
+  Precedence: user's saved settings win over the env key; with no
+  saved settings at all, the legacy env `GEMINI_API_KEY` is used
+  (Phase 2/3 behaviour, unchanged).
+- **Token ledger** (`ai_usage` table + `/app/usage`): every AI attempt
+  logged — when, purpose (finding clips / words judge / reaction
+  judge / hand clip), creator, video, provider, model, input/output/
+  total tokens, token source (reported / estimated / none), method,
+  status. Usage page: 30-day cards, tokens-per-day chart, "What it
+  was used for", "By creator", recent 50 calls. Sidebar "AI … today"
+  and the dashboard AI card show real ledger counts. "finding clips"
+  rows carry 0 tokens by design (their tokens live on the "words
+  judge" row — totals are never double-counted).
+- **Auth hardening (Phase 5 flag):** `/render-clip` and `/remake-clip`
+  now require login + ownership (401 unauth, 403 other user's video;
+  ownerless legacy uploads may be rendered by any logged-in user).
+  Note: the anonymous classic studio (`/`) can no longer render
+  without login — sign in first, or use the `/app` dashboard.
+- **Per-provider status:** Gemini works (live-verification still needs
+  the user's own key — no key existed during Phase 6 testing, so all
+  test runs are rule_based). OpenAI/Grok/Groq/OpenRouter/Custom:
+  adapter implemented, untested live. Claude: implemented, untested,
+  no list-models API. Ollama: implemented, untested (no Ollama here;
+  local-only — none on Render Free).
+
+## Phase 7 (16 Nov 2026) — Live recorder (TEST-PASS, local real runs)
+
+Full evidence: `../PHASE7_REPORT.md`. Browser capture is the route that
+works free: `/live/record` (camera/mic or screen, MediaRecorder,
+~60s segments made by stop/start so each chunk is a complete playable
+file) → `POST /live/{id}/chunk` → one worker thread, one chunk at a
+time (transcribe → dual-judge find-clips → render) so captioned clips
+appear BEFORE the session ends → Stop concats the chunks into one
+session video in All videos/projects. Dashboard "Recording now" tile
+is real now; creators table has a Live? column + Check button.
+- **Live check (yt-dlp only, no keys):** `POST /live/check` with a
+  creator_id or channel_link. YouTube `<channel>/live`, Twitch/Kick
+  channel URL. `live=null` means "pata nahi chala", never a guess.
+  Verified 16 Nov 2026: YouTube `@LofiGirl` → live=true (video id
+  resolved); Twitch `shroud` → offline (explicit message); YouTube
+  `@global.baatien` → unknown (tab API 404 — on a datacenter IP that
+  404 is NOT proof of offline); Kick `xqc` → unknown (403).
+- **URL capture:** `POST /live/start-from-url` — yt-dlp into
+  kill-tolerant .mkv, then the full pipeline when the stream ends or
+  Stop kills it. Verified: localhost mp4 → stopped, 2 clips
+  (words 65/52, reaction 73/76), both renders 720x1280 yuv420p.
+  YouTube is blocked from datacenter IPs (403 / bot-check) and yt-dlp
+  hangs in extraction for many minutes on a blocked URL — Stop ends it
+  promptly (verified twice). No cookies are used.
+- **Safety (Render Free 512 MB):** single worker, sequential renders,
+  Whisper freed per chunk, no in-memory video, chunks on disk, 200 MB
+  per chunk, 100 MB user quota, startup sweep marks restart-orphaned
+  chunks. Observed RSS ~180 MB during a live session. Render sleeps
+  after 15 min idle — a live session WILL be cut by a restart/sleep
+  there; long recordings belong on a machine that stays awake.
+- **Bugs fixed en route:** `/app/videos` 500 for ANY project (pre-existing:
+  `p["id"]` vs `get_project_status`'s `"upload_id"`); stop-race that left
+  URL sessions stuck in `stopping`; `POST /app/creators` 500 caused by
+  the Phase 7 migration (explicit column list now); YouTube 404 wrongly
+  read as "offline".
+- **Limits:** no live chat (Reaction judge = loudness only); re-make
+  needs the stopped session; record page JS code-reviewed only, not
+  tested in a real browser yet; Gemini words judge still unverified
+  live (no key ever set — all test clips rule_based).
+
+## Not done yet (Phases 8–10, see CLONE_PLAN.md §4)
+
+Phase 8 posting queue · Phase 9 upgrades · Phase 10 polish + landing +
+legal pages + deploy.
 
 ## Blocked / needs the user
 

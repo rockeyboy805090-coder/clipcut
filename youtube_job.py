@@ -1269,11 +1269,27 @@ def run_youtube_job(job_id: str) -> None:
         # --- find clips ---
         _update_job(job_id, status="finding_clips",
                     message="Viral clips dhoondh raha hoon…")
+        # Phase 6: the job owner's BYOK config drives the words judge
+        # (their provider/model/key); anonymous jobs keep the legacy
+        # env-key behaviour. Ledger rows are written per owner.
+        ai_config = None
+        ledger_ctx = None
+        try:
+            from ai_providers import get_effective_ai_config
+            _uid = job.get("user_id")
+            if _uid:
+                ai_config = get_effective_ai_config(DB_PATH, _uid)
+                ledger_ctx = {"db_path": DB_PATH, "user_id": _uid,
+                              "upload_id": upload_id,
+                              "creator_id": job.get("creator_id")}
+        except Exception:
+            ai_config, ledger_ctx = None, None
         # Phase 3: pass the downloaded file so the Reaction judge can
         # measure loudness (without it the reaction score is neutral 50).
         clips_data = find_clips(transcript, upload_id, top_n=top_n,
                                 language=language, options=job_options,
-                                video_path=video_path)
+                                video_path=video_path, ai_config=ai_config,
+                                ledger_ctx=ledger_ctx)
         clips = clips_data.get("clips", [])
         if not clips:
             raise ValueError(

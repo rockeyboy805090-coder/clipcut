@@ -6,3 +6,6 @@ outputs/
 .node/
 __pycache__/
 .env
+# Phase 6: server-side secret for API-key encryption (generated locally,
+# never committed — without it saved keys cannot be decrypted).
+.clipcut_key_secret
