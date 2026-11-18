@@ -12,6 +12,20 @@ via CTranslate2 in int8 on CPU: ~150 MB model, a few hundred MB RAM,
 no torch, no CUDA. Same model names (tiny/base/small), same word
 timestamps, same output format.
 
+WHY transcribe_isolated (Phase 10 fix, 18 Nov 2026): faster-whisper
+was NOT enough. Measured on real runs, in-server peaks: base ~660 MB
+RSS, Hindi small ~920 MB — both above Render Free's 512 MB, so the
+old in-process transcribe still OOM-killed the whole server
+mid-transcribe and the restart wiped the ephemeral SQLite DB: the
+upload then returned "upload not found" and Project Status showed
+count 0 (the launch bug seen live 18 Nov 05:53-05:59 IST). So
+transcription now runs in a forked CHILD process (transcribe_isolated):
+an OOM kills only the child — the server, the DB row and the uploaded
+file all survive, and the caller gets a clean 503 instead of a dead
+connection. A pre-flight memory guard also refuses the Hindi small
+model fast (it cannot fit in 512 MB at all) instead of spinning
+~2 min and then crashing.
+
 Behaviour:
 - Extract audio from the video with FFmpeg to 16 kHz mono WAV in
   a temp file (deleted after transcription).
@@ -40,11 +54,13 @@ from __future__ import annotations
 
 import gc
 import json
+import multiprocessing
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 from utils import probe_video
@@ -154,7 +170,13 @@ def _load_model(model_name: str):
         raise RuntimeError(
             "faster-whisper install karo: pip install faster-whisper"
         ) from exc
-    return WhisperModel(model_name, device="cpu", compute_type="int8")
+    # Phase 10 fix: one inference thread. Measured on real runs
+    # (20s speech, standalone process): base peaks at ~317 MB RSS
+    # with cpu_threads=1 vs ~375 MB with 2 threads, for ~3s slower
+    # decoding. On a 512 MB container that margin is the difference
+    # between a transcript and an OOM kill.
+    return WhisperModel(model_name, device="cpu", compute_type="int8",
+                        cpu_threads=1)
 
 
 def _read_wav_mono16(wav_path: Path):
@@ -356,10 +378,14 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     json_path = TRANSCRIPTS_DIR / f"{upload_id}.json"
     txt_path = TRANSCRIPTS_DIR / f"{upload_id}.txt"
-    json_path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-    txt_path.write_text(text, encoding="utf-8")
     out["transcript_json"] = str(json_path)
     out["transcript_txt"] = str(txt_path)
+    # Phase 10 fix: the paths must be IN the written file, not added
+    # to the in-memory dict afterwards — transcribe_isolated() loads
+    # the result back from disk, and /transcribe reads
+    # result["transcript_json"] (a KeyError 500 before this fix).
+    json_path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    txt_path.write_text(text, encoding="utf-8")
     return out
 
 
@@ -369,3 +395,184 @@ def load_transcript(upload_id: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"Transcript nahi mila: {upload_id} — pehle POST /transcribe karo")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ----------------------------------------------------------------------
+# Phase 10 fix: isolated transcription (see module docstring).
+#
+# Root cause, verified 18 Nov 2026: there is only ONE upload store —
+# every writer (dashboard /app/upload, studio /upload, YouTube jobs,
+# live recorder) inserts into the same `uploads` table of the same
+# clipcut.sqlite3, and every reader (/transcribe, /find-clips,
+# /projects) reads that same table. The live "upload not found" /
+# "count 0" was NOT two registries: the in-process transcribe
+# OOM-killed the whole server (base ~660 MB, Hindi small ~920 MB
+# peak RSS vs Render Free's 512 MB) and the restart wiped the
+# ephemeral DB, so the upload row was simply gone. The fix below
+# makes a transcribe OOM survivable instead of pretending the
+# registry was split.
+# ----------------------------------------------------------------------
+
+_TRANSCRIBE_LOCK = threading.Lock()
+# Free RAM (MB) a model needs available before it is even attempted.
+# Measured standalone peaks, cpu_threads=1: base ~317 MB, small
+# ~662 MB. The child is forked, so its parent-shared pages don't
+# count twice — these are the child's own new allocations, rounded
+# up with margin. "base" is attempted when >=300 MB is free (it may
+# still fail inside the child on a tight box — safely, see below);
+# "small" is refused below 700 MB because it cannot fit in a 512 MB
+# container at all, and refusing fast beats a ~2 min spin + crash.
+_MODEL_MIN_FREE_MB = {"tiny": 150, "tiny.en": 150, "base": 300,
+                      "base.en": 300, "small": 700, "small.en": 700,
+                      "medium": 1400, "medium.en": 1400,
+                      "large": 2500, "large-v3": 2500}
+
+
+def _available_memory_mb() -> int | None:
+    """Free RAM (MB) this container may still use, or None if unknown.
+
+    Render Free runs in a cgroup with a 512 MB limit — /proc/meminfo
+    shows the HOST's RAM, so it is useless there. Read the cgroup
+    limit minus non-reclaimable (anonymous) usage instead: page cache
+    is reclaimable, so it must NOT count as used.
+    """
+    def _read_int(path: str) -> int | None:
+        try:
+            return int(Path(path).read_text().strip())
+        except Exception:
+            return None
+
+    # cgroup v2 (Render, modern kernels): "max" means no limit.
+    limit = _read_int("/sys/fs/cgroup/memory.max")
+    if limit is not None and 0 < limit < (1 << 62):
+        anon = None
+        try:
+            for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines():
+                if line.startswith("anon "):
+                    anon = int(line.split()[1])
+                    break
+        except Exception:
+            anon = None
+        if anon is not None:
+            return max(0, (limit - anon) // (1024 * 1024))
+        current = _read_int("/sys/fs/cgroup/memory.current")
+        if current is not None:
+            return max(0, (limit - current) // (1024 * 1024))
+    # cgroup v1.
+    limit = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if limit is not None and 0 < limit < (1 << 62):
+        current = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        if current is not None:
+            return max(0, (limit - current) // (1024 * 1024))
+    # No cgroup limit: host MemAvailable is meaningful.
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
+def _transcribe_child(q, video_path_str: str, upload_id: str,
+                      model_name, initial_prompt, language) -> None:
+    """Runs in the forked child only: transcribe, report, exit.
+
+    Only a small summary crosses the queue — the full transcript is
+    already on disk (transcribe() writes outputs/transcripts/<id>.json)
+    and the parent loads it from there. The child must never die
+    silently: every failure is reported on the queue.
+    """
+    try:
+        result = transcribe(Path(video_path_str), upload_id,
+                            model_name=model_name,
+                            initial_prompt=initial_prompt,
+                            language=language)
+        q.put(("ok", {"model": result.get("model"),
+                      "word_count": result.get("word_count"),
+                      "language": result.get("language"),
+                      "language_requested": result.get("language_requested"),
+                      "transcript_script": result.get("transcript_script")}))
+    except Exception as exc:  # noqa: BLE001 — child must report, never die silently
+        try:
+            q.put(("error", f"{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+
+
+def transcribe_isolated(video_path, upload_id: str,
+                        model_name: str | None = None,
+                        initial_prompt: str | None = None,
+                        language: str | None = None,
+                        timeout: int = 1800) -> dict:
+    """Transcribe in an isolated child process. Same signature and
+    same return value as transcribe() — callers just swap the name.
+
+    Guarantees:
+    - The server process never loads a Whisper model, so a transcribe
+      OOM kills only the child. The server, the uploads table and the
+      uploaded file all survive; the caller gets a RuntimeError
+      (endpoints map it to 503) instead of a dead connection.
+    - One transcribe at a time, server-wide: two concurrent models
+      would double the RAM and kill the parent anyway.
+    - The Hindi small model is refused fast when it cannot fit
+      (Render Free 512 MB): an instant clear 503 instead of a ~2 min
+      spin followed by a crash that wipes the upload.
+    """
+    # Resolve the effective model first — same rules as transcribe():
+    # Hindi with no explicit model upgrades base -> small.
+    eff_model = normalize_model(model_name)
+    eff_language = normalize_language(
+        language or os.getenv("WHISPER_LANGUAGE") or DEFAULT_LANGUAGE)
+    if eff_language == "hi" and model_name is None and eff_model == "base":
+        eff_model = "small"
+    # Pre-flight memory guard: fail fast, never start a doomed job.
+    avail = _available_memory_mb()
+    need = _MODEL_MIN_FREE_MB.get(eff_model, 700)
+    if avail is not None and avail < need:
+        raise RuntimeError(
+            f"Transcription ke liye {need} MB free RAM chahiye ({eff_model} model), "
+            f"is server par sirf {avail} MB free hai — upload safe hai, kuch delete "
+            f"nahi hua. Render Free (512 MB) par Hindi small model nahi chal sakta; "
+            f"English (base) try karo, ya bade server par chalao.")
+    if not _TRANSCRIBE_LOCK.acquire(blocking=False):
+        raise RuntimeError(
+            "Ek transcribe already chal raha hai — ek hi transcribe ek baar me "
+            "chal sakta hai (512 MB RAM), thoda ruk kar dobara try karo. Upload safe hai.")
+    try:
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except Exception:
+            # No fork (non-Linux): fall back to in-process, same as before.
+            return transcribe(video_path, upload_id, model_name=model_name,
+                              initial_prompt=initial_prompt, language=language)
+        q = ctx.Queue()
+        proc = ctx.Process(
+            target=_transcribe_child,
+            args=(q, str(video_path), upload_id, model_name,
+                  initial_prompt, language))
+        proc.start()
+        try:
+            status, payload = q.get(timeout=timeout)
+        except Exception:
+            # No answer from the child: it was either killed (OOM =
+            # negative exit code, e.g. -9) or it hung past the timeout.
+            proc.join(timeout=10)
+            if proc.exitcode is not None and proc.exitcode < 0:
+                raise RuntimeError(
+                    "Transcription process ko OS ne memory ke liye maar diya (OOM) — "
+                    "server aur upload safe hain. Chhoti video try karo ya English "
+                    "(base) model use karo; Hindi small model is server par nahi chal sakta.")
+            proc.terminate()
+            proc.join(timeout=10)
+            raise RuntimeError(
+                "Transcription time out ho gaya — server zinda hai, upload safe "
+                "hai, dobara try karo ya chhoti video do.")
+        proc.join(timeout=10)
+        if status != "ok":
+            raise RuntimeError(str(payload))
+        # The child already wrote outputs/transcripts/<id>.json — load
+        # the full result from disk (the queue carries only a summary).
+        return load_transcript(upload_id)
+    finally:
+        _TRANSCRIBE_LOCK.release()

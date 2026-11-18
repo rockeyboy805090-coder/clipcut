@@ -76,7 +76,8 @@ from auth import (SESSION_COOKIE, STORAGE_QUOTA_BYTES, create_creator,
 from style_extractor import (ensure_default_profile, extract_style,
                              list_styles, load_style, save_profile)
 from transcriber import (load_transcript, normalize_language,
-                         normalize_language_strict, transcribe)
+                         normalize_language_strict, transcribe,
+                         transcribe_isolated)
 from clip_finder import (create_hand_clip, find_clips, load_clips,
                          update_clip)
 from editor import (find_render_info, list_render_versions,
@@ -580,7 +581,7 @@ async def transcribe_endpoint(
         # cut the client connection while the server was still
         # working. to_thread keeps the loop (and /health) responsive.
         result = await asyncio.to_thread(
-            transcribe, video_path, upload_id, model_name=model or None,
+            transcribe_isolated, video_path, upload_id, model_name=model or None,
             initial_prompt=initial_prompt or None,
             language=eff_language)
     except RuntimeError as exc:
@@ -687,7 +688,7 @@ async def find_clips_endpoint(
         try:
             # Same worker-thread rule as /transcribe (see above).
             transcript = await asyncio.to_thread(
-                transcribe, video_path, upload_id,
+                transcribe_isolated, video_path, upload_id,
                 language=eff_language)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
@@ -704,7 +705,7 @@ async def find_clips_endpoint(
     if transcript.get("language_requested") != eff_language:
         try:
             transcript = await asyncio.to_thread(
-                transcribe, video_path, upload_id, language=eff_language)
+                transcribe_isolated, video_path, upload_id, language=eff_language)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         except ValueError as exc:
@@ -755,7 +756,7 @@ async def _ensure_transcript_language(video_path, upload_id: str,
     wanted = normalize_language(caption_language) if caption_language else None
     if not wanted or transcript.get("language_requested") == wanted:
         return transcript, False
-    fresh = await asyncio.to_thread(transcribe, video_path, upload_id,
+    fresh = await asyncio.to_thread(transcribe_isolated, video_path, upload_id,
                                     language=wanted)
     if not fresh.get("words"):
         raise HTTPException(
@@ -2049,7 +2050,9 @@ def all_videos(request: Request, creator: str | None = None) -> HTMLResponse:
                 for c in creators) + "</p>"
             f"<div class=\"card\">{table}</div>"
             f"<p><a class=\"btn\" href=\"/app\">＋ Add a video</a> "
-            f"<a class=\"btn ghost\" href=\"/\">Open classic studio</a></p>")
+            # Phase 10 fix: this link said href="/" (landing page) —
+            # the working studio lives at /studio.
+            f"<a class=\"btn ghost\" href=\"/studio\">Open classic studio</a></p>")
     return _app_layout(user, "All videos", body)
 
 
@@ -2377,6 +2380,31 @@ def video_detail(request: Request, upload_id: str) -> HTMLResponse:
                      if not _gate_locked and clips else
                      "<p class=\"muted\">Render All tabhi chalega jab ek test clip approved ho — clip editor me kisi clip ko Approve dabao.</p>")
                   + "</div>")
+    # Phase 10 fix: the dashboard card promises "video page par
+    # transcribe + find-clips karo", but this page offered neither —
+    # the only path was the studio with a hand-pasted id. The card
+    # below runs the same /transcribe + /find-clips endpoints with
+    # this page's upload id prefilled, so the dashboard upload never
+    # needs the studio at all (the studio link stays as an option,
+    # with the id prefilled via ?upload_id=).
+    try:
+        _tr = load_transcript(upload_id)
+        _tr_state = (f"✅ Transcript ban gaya — {_tr.get('word_count', '?')} words "
+                     f"({_tr.get('language_requested', 'en')}, {_tr.get('model', '?')})")
+    except FileNotFoundError:
+        _tr_state = "❌ Transcript abhi nahi bana"
+    _pipe_card = (f"<div class=\"card\"><h3>Transcribe &amp; find clips</h3>"
+                  f"<p class=\"muted\">{_html.escape(_tr_state)} · Clips: {len(clips)}</p>"
+                  f"<label>Caption language<select id=\"pipe-lang\">"
+                  f"<option value=\"en\">English</option>"
+                  f"<option value=\"hi\">Hindi (Devanagari)</option>"
+                  f"<option value=\"hinglish\">Hinglish (Roman)</option></select></label>"
+                  f"<p><button class=\"btn\" type=\"button\" id=\"pipe-transcribe-btn\">1. Transcribe</button> "
+                  f"<button class=\"btn\" type=\"button\" id=\"pipe-findclips-btn\">2. Find Viral Clips</button></p>"
+                  f"<p id=\"pipe-status\" class=\"muted\"></p><p id=\"pipe-error\" class=\"err\"></p>"
+                  f"<p class=\"muted\">Ya classic studio me kholo: "
+                  f"<a href=\"/studio?upload_id={upload_id}\">Open in classic studio →</a> "
+                  f"(upload id pehle se bhara hoga).</p></div>")
     if clips:
         clip_rows = "".join(
             f"<tr><td><a href=\"/app/videos/{upload_id}/clips/{c['clip_id']}\">{c['clip_id']}</a></td>"
@@ -2391,11 +2419,12 @@ def video_detail(request: Request, upload_id: str) -> HTMLResponse:
                  "<th>Combined</th><th>Words</th><th>Reaction</th><th>Source</th><th></th></tr>"
                  + clip_rows + "</table>")
     else:
-        table = ("<p class=\"muted\">Abhi koi clip nahi hai — classic studio "
+        table = ("<p class=\"muted\">Abhi koi clip nahi hai — upar Transcribe &amp; find clips "
                  "se pehle transcribe + find-clips karo, ya neeche Hand clip banao.</p>")
     body = f"""<h1>{_html.escape(str(row['original_name']))}</h1>
 <p class="muted"><a href="/app/videos">← All videos</a> · {duration:.1f}s · {row['size_bytes'] // 1024} KB · {len(clips)} clips</p>
 {_gate_card}
+{_pipe_card}
 <div class="card"><h3>Clips</h3>{table}</div>
 <div class="card"><h3>Hand clip — manual range, no AI gate</h3>
 <p class="muted">Khud start/end do — AI judge nahi lagta. Scores sirf jaankari ke liye dikhte hain.</p>
@@ -2439,6 +2468,34 @@ if (raBtn) {{
     }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err; raBtn.disabled = false; }}
   }});
 }}
+async function pipePost(url, fields) {{
+  const fd = new FormData(); Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+  const r = await fetch(url, {{method:'POST', body: fd}});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
+  return j;
+}}
+document.getElementById('pipe-transcribe-btn').addEventListener('click', async (e) => {{
+  const btn = e.target, st = document.getElementById('pipe-status'), er = document.getElementById('pipe-error');
+  er.textContent = ''; st.textContent = 'Transcribing… (Whisper, time lagega — page band mat karo)';
+  btn.disabled = true;
+  try {{
+    const j = await pipePost('/transcribe', {{upload_id: '{upload_id}', caption_language: document.getElementById('pipe-lang').value}});
+    st.textContent = 'Transcript ready — ' + j.word_count + ' words (' + j.model + ', ' + (j.transcript_script || '') + '). Ab Find Viral Clips dabao.';
+  }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err.message; }}
+  finally {{ btn.disabled = false; }}
+}});
+document.getElementById('pipe-findclips-btn').addEventListener('click', async (e) => {{
+  const btn = e.target, st = document.getElementById('pipe-status'), er = document.getElementById('pipe-error');
+  er.textContent = ''; st.textContent = 'Finding clips…';
+  btn.disabled = true;
+  try {{
+    const j = await pipePost('/find-clips', {{upload_id: '{upload_id}', caption_language: document.getElementById('pipe-lang').value, top_n: '2'}});
+    st.textContent = 'Clips ready — ' + (j.clips || []).length + ' clips. Page reload ho raha hai…';
+    setTimeout(() => location.reload(), 800);
+  }} catch (err) {{ st.textContent = ''; er.textContent = 'Error: ' + err.message; }}
+  finally {{ btn.disabled = false; }}
+}});
 </script>
 """
     return _app_layout(user, "All videos", body)

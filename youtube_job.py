@@ -1198,7 +1198,7 @@ def run_youtube_job(job_id: str) -> None:
     # pipeline modules at module level would risk cycles.
     from clip_finder import find_clips
     from editor import render_clip
-    from transcriber import load_transcript, transcribe
+    from transcriber import load_transcript, transcribe_isolated
     from workflow import is_clip_rendered_for_upload, set_clip_approval
 
     try:
@@ -1255,7 +1255,7 @@ def run_youtube_job(job_id: str) -> None:
         # --- transcribe ---
         _update_job(job_id, status="transcribing",
                     message="Transcript ban raha hai (faster-whisper)…")
-        transcript = transcribe(video_path, upload_id, language=language)
+        transcript = transcribe_isolated(video_path, upload_id, language=language)
         if not transcript.get("words"):
             raise ValueError(
                 "Transcript khaali hai — video me boli hui baat nahi mili, "

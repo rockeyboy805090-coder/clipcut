@@ -395,14 +395,28 @@ async function postForm(url, fields){
   if (r.ok && b.clips) renderClips(b);
   return {r, b};
 }
+// Phase 10 fix: /studio?upload_id=<id> (video page se aane par) teeno
+// id fields bhar deta hai — id haath se paste karne ki zaroorat nahi.
+(function(){ try { const pre = new URLSearchParams(location.search).get('upload_id'); if (pre) { ['#clip-upload-id','#render-upload-id','#approve-upload-id'].forEach(s => { const el = document.querySelector(s); if (el) el.value = pre; }); } } catch (e) {} })();
+function showConnError(err){
+  // Phase 10 fix: pehle yahan catch hi nahi tha — server restart
+  // (Render Free par transcribe OOM) hone par fetch reject hota tha
+  // aur result box khaali rehta tha ("spins then shows nothing").
+  // Ab asli error dikhta hai, aur upload dobara check karne ka rasta.
+  const el = document.querySelector('#clip-result');
+  el.textContent = 'Error: server se connection toot gaya — ' + err + '. Agar Render Free par transcribe ke dauraan server restart hua ho to upload dobara check karo: Refresh History dabao ya /projects kholo.';
+  el.classList.remove('hidden'); el.classList.add('text-red-300');
+}
 document.querySelector('#transcribe-btn').addEventListener('click', async (e) => {
   const btn = e.target; btn.disabled = true; btn.textContent = 'Transcribing… (Whisper, time lagega)';
   try { await postForm('/transcribe', {upload_id: document.querySelector('#clip-upload-id').value, language: document.querySelector('#clip-language').value}); }
+  catch (err) { showConnError(err); }
   finally { btn.disabled = false; btn.textContent = '1. Transcribe'; }
 });
 document.querySelector('#findclips-btn').addEventListener('click', async (e) => {
   const btn = e.target; btn.disabled = true; btn.textContent = 'Finding clips…';
   try { await postForm('/find-clips', {upload_id: document.querySelector('#clip-upload-id').value, top_n: document.querySelector('#clip-topn').value, language: document.querySelector('#clip-language').value, min_sec: document.querySelector('#clip-minsec').value, max_sec: document.querySelector('#clip-maxsec').value, video_type: document.querySelector('#clip-type').value, from_min: document.querySelector('#clip-frommin').value, to_min: document.querySelector('#clip-tomin').value}); }
+  catch (err) { showConnError(err); }
   finally { btn.disabled = false; btn.textContent = '2. Find Viral Clips'; }
 });
 // --- Phase 3: Render 1 Test Clip ---

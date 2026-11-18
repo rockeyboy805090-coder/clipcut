@@ -488,7 +488,7 @@ def _process_chunk(session_id: str, chunk_index: int) -> None:
     """
     from clip_finder import find_clips, load_clips, save_clips
     from editor import render_clip
-    from transcriber import transcribe
+    from transcriber import transcribe_isolated
     from utils import probe_video
     from ai_providers import get_effective_ai_config
 
@@ -528,7 +528,7 @@ def _process_chunk(session_id: str, chunk_index: int) -> None:
         _set_chunk(db_path, session_id, chunk_index,
                    start_sec=chunk_start, duration_sec=round(duration, 2))
         # 2. Transcribe the chunk (frees its Whisper model afterwards).
-        transcript = transcribe(chunk_mp4, chunk_transcript_id,
+        transcript = transcribe_isolated(chunk_mp4, chunk_transcript_id,
                                 language=session["language"])
         if not transcript.get("words"):
             _set_chunk(db_path, session_id, chunk_index, status="done",
@@ -964,7 +964,7 @@ def _run_url_capture(db_path: str, root: str, session_id: str,
     from youtube_job import _base_yt_dlp_args, _yt_dlp_cmd, _yt_dlp_env
     from clip_finder import find_clips
     from editor import render_clip
-    from transcriber import transcribe
+    from transcriber import transcribe_isolated
     from utils import probe_video
     from ai_providers import get_effective_ai_config
 
@@ -1033,7 +1033,7 @@ def _run_url_capture(db_path: str, root: str, session_id: str,
                          (out_path.stat().st_size, session["upload_id"]))
             conn.commit()
         # Full pipeline on the captured video.
-        transcript = transcribe(out_path, session["upload_id"],
+        transcript = transcribe_isolated(out_path, session["upload_id"],
                                 language=session["language"])
         if not transcript.get("words"):
             raise ValueError("Transcript khaali hai — captured video me boli hui baat nahi mili")

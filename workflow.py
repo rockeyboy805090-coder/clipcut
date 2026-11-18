@@ -350,7 +350,7 @@ def run_batch(batch_id: str) -> None:
     Runs in a background thread; each item records ok/error honestly.
     """
     from clip_finder import find_clips  # local import: avoids cycles
-    from transcriber import load_transcript, transcribe
+    from transcriber import load_transcript, transcribe_isolated
 
     try:
         batch = get_batch(batch_id)
@@ -379,7 +379,7 @@ def run_batch(batch_id: str) -> None:
                 transcript = load_transcript(uid)
                 item["transcript"] = "existing"
             except FileNotFoundError:
-                transcript = transcribe(video_path, uid, language=language)
+                transcript = transcribe_isolated(video_path, uid, language=language)
                 item["transcript"] = "new"
             if not transcript.get("words"):
                 raise ValueError("Transcript khaali hai — clips nahi ban sakte")
