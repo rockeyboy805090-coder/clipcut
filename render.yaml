@@ -1,27 +1,12 @@
-# ClipCut — Render Free web service (Phase 10 verified, NOT deployed yet).
-# Deploy: Blueprint from the repo root render.yaml (see ../render.yaml,
-# same service definition — NO rootDir anywhere: the GitHub snapshot
-# push flattens app/ to the repo root, there is no app/ directory on
-# GitHub) OR manual web service with Root Directory left EMPTY.
-# Free plan, no card, no domain. Full steps: ../DEPLOY.md — do NOT
-# deploy from here without reading it.
-# Env vars to set in the Render dashboard (never commit real keys):
-#   GEMINI_API_KEY=<redacted>  (Phase 2/3 only)
-#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI
-#     (Google sign-in — Phase 1 placeholder, leave unset until ready)
-#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / YOUTUBE_REDIRECT_URI
-#     (Phase 8 YouTube Shorts posting — same client, separate redirect
-#     URI; also enable YouTube Data API v3 in that Google project.
-#     Leave unset until the user creates the OAuth client.)
-# NOTE: Render Free = 512 MB RAM, sleeps after 15 min idle, ~1 min cold start.
-# Filesystem is EPHEMERAL (no persistent disk on free) — uploads, the
-# SQLite DB, transcripts, clips and renders are all wiped on restart.
-# Download clips you want to keep. Transcription now uses faster-whisper
-# (CTranslate2, int8, NO torch) — safe on 512 MB. First transcribe
-# downloads the base model (~150 MB) from HuggingFace, then it is cached.
-# Heavy rendering is for local laptop use. Hindi captions auto-upgrade
-# Whisper base -> small (~2x RAM, slower) — small-model OOM on 512 MB
-# is UNTESTED live (Phase 9 report §4); test on Render before promising Hindi.
+# ClipCut — repo-root Blueprint (Phase 10, fixed 18 Nov 2026).
+# Render looks for render.yaml at the REPO ROOT. The app lives AT the
+# repo root (the GitHub snapshot push flattens app/ to root — there is
+# NO app/ directory on GitHub), so there is NO rootDir line here: the
+# earlier rootDir: app broke the first Blueprint deploy ("Root directory
+# 'app' does not exist"). Same service definition as app/render.yaml —
+# keep the two in sync. Deploy steps: DEPLOY.md. Free plan, no card,
+# no domain.
+# NOTE: no persistent disk on free — uploads + SQLite are ephemeral.
 services:
   - type: web
     name: clipcut
