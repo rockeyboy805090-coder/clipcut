@@ -1,6 +1,8 @@
-# ClipCut — Render Free web service (NOT deployed yet; Phase 10).
-# Deploy: user creates the GitHub repo in his browser, pushes this
-# folder, connects it in Render, free plan, no card.
+# ClipCut — Render Free web service (Phase 10 verified, NOT deployed yet).
+# Deploy: Blueprint from the repo root render.yaml (rootDir: app — see
+# ../render.yaml, same service definition) OR manual web service with
+# Root Directory = app. Free plan, no card, no domain. Full steps:
+# ../DEPLOY.md — do NOT deploy from here without reading it.
 # Env vars to set in the Render dashboard (never commit real keys):
 #   GEMINI_API_KEY=<redacted>  (Phase 2/3 only)
 #   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI
@@ -10,15 +12,22 @@
 #     URI; also enable YouTube Data API v3 in that Google project.
 #     Leave unset until the user creates the OAuth client.)
 # NOTE: Render Free = 512 MB RAM, sleeps after 15 min idle, ~1 min cold start.
-# Transcription now uses faster-whisper (CTranslate2, int8, NO torch) —
-# safe on 512 MB. First transcribe downloads the base model (~150 MB)
-# from HuggingFace, then it is cached. Heavy rendering is for local
-# laptop use.
+# Filesystem is EPHEMERAL (no persistent disk on free) — uploads, the
+# SQLite DB, transcripts, clips and renders are all wiped on restart.
+# Download clips you want to keep. Transcription now uses faster-whisper
+# (CTranslate2, int8, NO torch) — safe on 512 MB. First transcribe
+# downloads the base model (~150 MB) from HuggingFace, then it is cached.
+# Heavy rendering is for local laptop use. Hindi captions auto-upgrade
+# Whisper base -> small (~2x RAM, slower) — small-model OOM on 512 MB
+# is UNTESTED live (Phase 9 report §4); test on Render before promising Hindi.
 services:
   - type: web
     name: clipcut
     env: python
     plan: free
+    # Render polls this before shifting traffic to a new deploy; /health
+    # returns phase + ffmpeg + youtube diagnostics + worker status.
+    healthCheckPath: /health
     # Node 20 (JS runtime for yt-dlp): Render's Python env has no
     # `node`, and yt-dlp warns that YouTube extraction without a JS
     # runtime is deprecated / misses formats. The official linux-x64
@@ -55,3 +64,20 @@ services:
         value: en
       - key: WHISPER_MODEL
         value: base
+      # Server secret for Fernet-encrypting saved BYOK keys (Phase 6).
+      # Render generates a random value once and reuses it. Rotating it
+      # makes previously saved keys unreadable — do NOT rotate casually.
+      - key: CLIPCUT_KEY_SECRET
+        generateValue: true
+      # Optional — prompt at Blueprint setup, never stored in git:
+      # (leave empty until the user creates the OAuth client / key)
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: YOUTUBE_REDIRECT_URI
+        sync: false

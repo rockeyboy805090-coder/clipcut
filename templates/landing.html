@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClipCut — Clip live streams while they are still live</title>
+<meta name="description" content="ClipCut turns long videos and live streams into captioned 9:16 shorts. Paste a link or upload a file, two AI judges pick the moments, edit, and queue them for posting. Free and open source.">
+<style>
+body{background:#0d1230;color:#f4f4f5;font-family:sans-serif;margin:0;line-height:1.6}
+a{color:#f9a8d4}
+.wrap{max-width:960px;margin:0 auto;padding:0 20px}
+header{border-bottom:1px solid #262c5e}
+header .wrap{display:flex;align-items:center;gap:18px;padding:16px 20px;flex-wrap:wrap}
+.logo{font-size:22px;font-weight:800;letter-spacing:.04em;color:#fff;text-decoration:none}
+.logo span{color:#ff2e63}
+nav{flex:1;display:flex;gap:18px;flex-wrap:wrap}
+nav a{color:#e5e7eb;text-decoration:none;font-size:14px}
+.btn{display:inline-block;background:#ff2e63;color:#fff;border:0;border-radius:999px;padding:10px 22px;font-weight:700;cursor:pointer;text-decoration:none}
+.btn.ghost{background:#262c5e}
+.hero{text-align:center;padding:64px 20px 48px}
+.hero h1{font-size:44px;line-height:1.1;margin:0 0 16px;text-transform:uppercase;letter-spacing:.02em}
+.hero p{color:#a5b4fc;font-size:18px;max-width:640px;margin:0 auto 24px}
+.linkbox{background:#171c44;border:1px solid #262c5e;border-radius:14px;padding:18px;max-width:640px;margin:0 auto}
+.linkbox input{width:100%;background:#0d1230;border:1px solid #3b4380;border-radius:10px;color:#fff;padding:12px;box-sizing:border-box;font-size:15px}
+.trust{color:#a5b4fc;font-size:14px;margin-top:18px}
+section{padding:40px 0}
+h2{font-size:26px;text-transform:uppercase;letter-spacing:.02em;margin:0 0 8px}
+.lead{color:#a5b4fc;margin:0 0 20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+.card{background:#171c44;border:1px solid #262c5e;border-radius:14px;padding:18px}
+.card h3{margin:0 0 6px;font-size:17px}
+.card p{margin:0;color:#c7d2fe;font-size:14px}
+.card .tag{display:inline-block;background:#262c5e;border-radius:999px;padding:2px 10px;font-size:12px;margin-bottom:8px}
+.steps{counter-reset:step}
+.steps .card{position:relative}
+.steps .card b.num{font-size:28px;color:#ff2e63}
+.faq details{background:#171c44;border:1px solid #262c5e;border-radius:12px;padding:14px 18px;margin-top:10px}
+.faq summary{cursor:pointer;font-weight:700}
+.faq p{color:#c7d2fe;font-size:14px}
+.limits{background:#2a1218;border:1px solid #7f1d1d;border-radius:14px;padding:18px}
+.limits h2{color:#fca5a5}
+.limits li{color:#fecaca;font-size:14px}
+footer{border-top:1px solid #262c5e;padding:24px 0 40px;color:#a5b4fc;font-size:13px}
+footer a{margin-right:16px}
+.cta{text-align:center}
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<a class="logo" href="/">Clip<span>Cut</span></a>
+<nav>
+<a href="#how">How it works</a><a href="#features">Features</a><a href="#who">Who it&rsquo;s for</a><a href="#faq">FAQ</a><a href="/studio">Classic studio</a>
+</nav>
+<a class="btn ghost" href="/login">Sign in</a>
+<a class="btn" href="/signup">Sign up</a>
+</div></header>
+
+<main class="wrap">
+<div class="hero">
+<h1>CLIP LIVE STREAMS WHILE THEY ARE STILL LIVE.</h1>
+<p>Long video ya live stream do — ClipCut uske strongest moments dhoondhta hai aur captioned 9:16 shorts banata hai. Download karo, edit karo, ya post ke liye queue karo.</p>
+<div class="linkbox">
+<form method="get" action="/signup">
+<input type="url" name="link" placeholder="Paste a YouTube, Twitch or Kick video link" aria-label="Video link">
+<p style="margin:12px 0 0"><button class="btn" type="submit">Get clips</button>
+<a class="btn ghost" href="/app">Open dashboard</a></p>
+</form>
+<p class="trust">Free and open source &bull; Uses your own AI key &bull; Runs on your own server</p>
+</div>
+</div>
+
+<section id="how">
+<h2>How it works</h2>
+<p class="lead">Three steps — link se clip tak.</p>
+<div class="grid steps">
+<div class="card"><b class="num">1</b><h3>Paste a link or add a streamer</h3><p>Link dalo ya channel ek baar add karo. Caption style aur clip length choose karo — ya file upload karo, link ki zaroorat nahi.</p></div>
+<div class="card"><b class="num">2</b><h3>The AI finds the moments</h3><p>Poori recording transcribe hoti hai, do judges strongest moments pick aur score karte hain, aur vertical captioned clip banta hai. 15-minute video, lagbhag 2 minute me.</p></div>
+<div class="card"><b class="num">3</b><h3>Download, post, or keep editing</h3><p>Har clip captioned, scored, aur hook / title / description / hashtags ke saath. Trim karo, style badlo, download karo, ya post queue karo.</p></div>
+</div>
+<p class="lead" style="margin-top:16px">Live variant: channel ek baar add karo — live hote hi auto-record shuru, har minute check, aur stream chalte hue captioned clips ready.</p>
+</section>
+
+<section>
+<h2>Caption styles</h2>
+<p class="lead">Teen styles, har clip par switch kar sakte ho — ya kisi reference video ki style measure karke apni banao.</p>
+<div class="grid">
+<div class="card"><span class="tag">Default</span><h3>Bounce</h3><p>Big, bouncy captions with yellow highlights.</p></div>
+<div class="card"><span class="tag">Bold</span><h3>Hype</h3><p>Bold captions with pink highlights.</p></div>
+<div class="card"><span class="tag">Quiet</span><h3>Clean</h3><p>Quiet, plain captions — no highlight, no noise.</p></div>
+<div class="card"><span class="tag">Measured</span><h3>Custom (reference style)</h3><p>Reference video ki caption colours, size aur position measure karke saved style — preset overwrite nahi karta.</p></div>
+</div>
+</section>
+
+<section id="features">
+<h2>Features</h2>
+<p class="lead">Jo ClipCut karta hai — aur jo nahi karta, woh bhi neeche saaf likha hai.</p>
+<div class="grid">
+<div class="card"><h3>Dual-judge scoring</h3><p>Words judge sirf transcript padhta hai, reaction judge loudness (aur chat, jab mile) dekhta hai. Clip tabhi banta hai jab <b>dono agree karein</b> — words &ge; 50 aur reaction &ge; 40. Combined score = 0.6 &times; words + 0.4 &times; reaction.</p></div>
+<div class="card"><h3>Live recorder</h3><p>Browser se camera/screen record karo — har 60-second chunk se clips live bante hain, stream khatam hone ka wait nahi. Ya channel ka live status check karo aur URL capture karo.</p></div>
+<div class="card"><h3>Bring your own key (BYOK)</h3><p>Gemini, OpenAI, Grok, Groq, OpenRouter, Claude, Ollama ya Custom — apni key, apna provider. Keys Fernet-encrypted save hoti hain, aur har AI call token ledger me dikhti hai (/app/usage).</p></div>
+<div class="card"><h3>Posting queue</h3><p>Rendered clip ko YouTube Shorts, Instagram ya TikTok ke liye schedule karo — pause, resume, cancel, retry. Post tabhi &ldquo;posted&rdquo; kehlata hai jab platform real video id de.</p></div>
+<div class="card"><h3>Clip editor</h3><p>Trim start/end, hook aur title rewrite, caption style aur layout switch, phir Re-make — purana version overwrite nahi hota, naya version banta hai. Face-tracking crop bhi hai.</p></div>
+<div class="card"><h3>Hindi / Hinglish captions</h3><p>Caption language English, Hindi (Devanagari) ya Hinglish (Roman). Hindi ke liye Whisper small model chahiye — base model Hindi ko Urdu script me likhta hai, isliye auto-upgrade hota hai.</p></div>
+<div class="card"><h3>File upload — no link needed</h3><p>Reference app me file upload hai hi nahi; yahan hai. Apni video upload karo, wahi pipeline chalega. 100 MB quota per user — full hone par sabse purani video auto-delete.</p></div>
+<div class="card"><h3>Test-clip approval gate</h3><p>Render All tabhi khulta hai jab pehle 1 test clip approve ho. Pehle quality check karo, phir baaki clips render karo.</p></div>
+</div>
+</section>
+
+<section class="limits">
+<h2>Honest limits — please read before you sign up</h2>
+<ul>
+<li><b>YouTube download often fails from a datacenter IP (HTTP 403).</b> YouTube bot-checks server IPs; yt-dlp + impersonation + Invidious fallback wired hain, par guarantee nahi. <b>File upload hamesha kaam karta hai</b> — phone se download karke upload karo.</li>
+<li><b>Instagram / TikTok posting is &ldquo;Not set up on this server&rdquo;.</b> Inke liye official API + approval chahiye. Queue unhe honestly record karta hai, post karne ka naatak nahi karta. YouTube Shorts posting ke liye aapka Google OAuth client chahiye.</li>
+<li><b>Hindi captions need the Whisper small model</b> — slower (~1.4–3.7&times; realtime) aur ~2&times; RAM. Render Free (512 MB) par small model ka OOM risk abhi live-tested nahi hai.</li>
+<li><b>Gemini words judge kabhi live verify nahi hua</b> — koi key kabhi set nahi hui; bina key ke saare runs rule-based scoring se chalte hain.</li>
+<li><b>Render Free: 512 MB RAM, 15 min idle ke baad sleep, ~1 min cold start.</b> Uploads aur database ephemeral hain — restart par wipe ho jate hain. Clips download karke rakhna. YouTube OAuth callback bhi abhi live-untested hai.</li>
+<li><b>Brand &ldquo;ClipCut&rdquo; placeholder hai</b> — final naam abhi user ka pick baaki hai.</li>
+</ul>
+</section>
+
+<section id="who">
+<h2>Who it&rsquo;s for</h2>
+<div class="grid">
+<div class="card"><h3>Clippers</h3><p>Streams se shorts nikalo, score dekh kar best moments chuno.</p></div>
+<div class="card"><h3>Streamers</h3><p>Live hote hi clips — stream khatam hone se pehle hi Shorts ready.</p></div>
+<div class="card"><h3>Podcasters</h3><p>Long interview se 15–60s ke captioned highlights.</p></div>
+<div class="card"><h3>Agencies</h3><p>Har creator ka alag workspace, settings, folder aur posting rules.</p></div>
+<div class="card"><h3>Marketing teams</h3><p>Ek long video se kai shorts — hook, title, hashtags ke saath.</p></div>
+</div>
+</section>
+
+<section id="faq" class="faq">
+<h2>FAQ</h2>
+<details><summary>Is it really free?</summary><p>Haan — koi plan ya fees nahi. Sirf kharcha aapki apni AI key ka hai (aur woh bhi optional hai — bina key ke rule-based scoring se clips bante hain).</p></details>
+<details><summary>Which languages do captions support?</summary><p>English, Hindi (Devanagari) aur Hinglish (Roman). Hindi ke liye Whisper small model chahiye — dekho Honest limits upar.</p></details>
+<details><summary>How long are the clips?</summary><p>Default 15–60 seconds, 2 clips. Options me count 1–8, shortest 5s, longest 120s tak set kar sakte ho.</p></details>
+<details><summary>Can I post straight to Instagram or TikTok?</summary><p>Abhi nahi — dono &ldquo;Not set up on this server&rdquo; hain. YouTube Shorts queue + OAuth wired hai (aapka OAuth client chahiye). Baaki ke liye clip download karke phone se post karo — share guide app me hai.</p></details>
+<details><summary>My YouTube link fails with 403. Why?</summary><p>YouTube datacenter IPs ko block karta hai. Yeh ClipCut ki kharabi nahi — reference app aur doosre tools ko bhi wahi error milta hai. File upload use karo.</p></details>
+<details><summary>What happens to my videos on the free server?</summary><p>Render Free ka filesystem ephemeral hai — restart/sleep par uploads aur database wipe ho sakte hain. 100 MB quota hai; apne clips download karke rakhna.</p></details>
+<details><summary>Do you store my AI key safely?</summary><p>Aapki key server secret se Fernet-encrypted save hoti hai aur UI me sirf &ldquo;Saved, ends in &hellip;&rdquo; dikhti hai. Key kabhi full nahi dikhayi jati, aur kabhi pre-filled nahi aati.</p></details>
+</section>
+
+<section class="cta">
+<h2>Ready to clip?</h2>
+<p class="lead">Link paste karo ya file upload karo — pehla clip kuch minutes me.</p>
+<p><a class="btn" href="/signup">Create free account</a>
+<a class="btn ghost" href="/login">Sign in</a></p>
+<p class="trust">13+ only · One person per account · No advertising or analytics cookies</p>
+</section>
+</main>
+
+<footer><div class="wrap">
+<a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/acceptable-use">Acceptable Use</a><a href="/studio">Classic studio</a><a href="/health">System status</a>
+<p>ClipCut is a working-name placeholder, not the final brand. Free and open source — runs on your own server with your own AI key.</p>
+</div></footer>
+</body>
+</html>

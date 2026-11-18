@@ -275,9 +275,21 @@ Posted count comes from the queue.
 - **Test-clip approval gate (extended):** `/render-all` and `/approve-clip` / `/reject-clip` now require login + ownership (the guard used to be enforceable by anyone once a clip was approved). Gate state is explicit in project status (`render_all_locked`, `gate_message`) and shown on the video page (Render All button, locked/unlocked) and the clip page. Verified both ways: unapproved → 400, unauth → 401, approved → unlocked + renders.
 - **Bugs found & fixed during Phase 9 testing:** (1) `clip_finder.find_clips` built its own `options` dict without `caption_language`, so a Hindi project silently re-transcribed back to English at render time — fixed (recorded in clips file + transcript-language fallback in render/remake/render-all). (2) `normalize_language("urdu")` silently fell back to English — unknown caption languages are now a clear 400 (`normalize_language_strict`). (3) Caption presets overwrote extracted styles' measured colours — fixed with the Custom style (above).
 
-## Not done yet (Phase 10, see CLONE_PLAN.md §4)
+## Phase 10 (18 Nov 2026) — Polish + launch (TEST-PASS, local real runs; report: `../PHASE10_REPORT.md`)
 
-Phase 10 polish + landing + legal pages + deploy.
+- **Landing page (`/`, public, `templates/landing.html`):** teardown §1.1 sections — hero "CLIP LIVE STREAMS WHILE THEY ARE STILL LIVE." + link box + trust line, How it works (3 steps), caption styles (Bounce / Hype / Clean / Custom), Features (dual-judge, live recorder, BYOK, posting queue, editor, Hindi/Hinglish, file upload, approval gate), Honest limits box, Who it's for (5), FAQ (7), final CTA. No reference-app name or logo anywhere on the page (or in any user-facing UI string). The classic studio UI moved to **`/studio`** — same template, same API routes, nothing removed. Logged-in visitors see "Open your dashboard" instead of signup.
+- **Product tour (first-run checklist on `/app`):** 7 steps — creator → link/file → find clips → approve test clip → render → queue for posting → AI key — each with a **live** done-state (✅ only when really done) and a link to the right place. Dismissable (`POST /app/tour/dismiss`, `clipcut_tour` cookie, 1 year); sidebar "✦ Product tour" (`/app?tour=1`) brings it back. Verified 0/7 → 6/7 across a real run (step 7 stays open until a key is saved).
+- **Notifications (`/app/notifications`) are real now:** clips awaiting an approve/reject decision, queue items failed / waiting for a YouTube account / not set up, live sessions running. Empty = "Nothing yet" (no invented rows).
+- **Legal pages:** `/terms`, `/privacy`, `/acceptable-use` (own name, 13+, no ads/analytics cookies, BYOK keys encrypted, ephemeral free-tier storage, posting is the user's responsibility).
+- **Render deploy prep:** `app/render.yaml` verified for Render Free — `healthCheckPath: /health`, `CLIPCUT_KEY_SECRET` via `generateValue: true`, optional `GEMINI_API_KEY` / Google + YouTube OAuth values via `sync: false` (prompted at setup, never in git), no persistent disk (ephemeral FS stated in the file + README + landing). **Repo-root `render.yaml`** added (`rootDir: app`, same service) so a Blueprint deploy works from the repo alone. Exact parent steps: `../DEPLOY.md`. Nothing deployed in this phase; no Render credentials exist.
+- **QA sweep:** full fresh-DB end-to-end, **54/54 PASS** (`/tmp/p10_test.py`, log `/tmp/p10_test2.log`): signup → creator → upload (51.8s real speech) → transcribe (171 words, 18s) → find-clips (1 clip, combined 67) → gate locked 400 → approve → render 720x1280 yuv420p → render-all → queue IG → worker `not_set_up` with the honest wording → tour 6/7 → second-user isolation (approve 403, queue hidden) → unauth gates (303/401). Two driver bugs found in run 1 (hero case, tour-cookie masking, +1h schedule) — fixed in the driver + landing, re-run clean. gTTS was 429 during the run, so the test video was built with the local TTS tool instead.
+
+## Not done yet (live Render verification — needs the parent + user)
+
+Phase 10 code is done; the deploy itself and these three live checks are still open (see `../DEPLOY.md` + `../PHASE10_REPORT.md` §5):
+1. **Hindi Whisper small model on Render Free 512 MB** — OOM risk untested; first live Hindi transcribe decides whether Hindi can be promised.
+2. **YouTube OAuth callback live** — needs the user's `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `YOUTUBE_REDIRECT_URI` + YouTube Data API v3 enabled.
+3. **Gemini words judge live** — needs the user's own key in Settings/AI; all runs so far are rule-based.
 
 ## Blocked / needs the user
 

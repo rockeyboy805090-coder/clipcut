@@ -33,6 +33,14 @@ Phase 9 (17 Nov 2026): upgrades — dashboard file upload (/app/upload,
   time-varying ffmpeg crop), test-clip approval gate extended
   (render-all login+ownership, gate state in project status +
   video/clip pages).
+Phase 10 (18 Nov 2026): polish + launch — public landing page (/,
+  honest limits included), classic studio moved to /studio, in-app
+  product tour (first-run checklist on the dashboard, live done-states,
+  dismissable), real Notifications page (clips needing a decision +
+  queue problems), Terms/Privacy/Acceptable Use pages, render.yaml
+  verified for Render Free (healthCheckPath /health, CLIPCUT_KEY_SECRET
+  via generateValue, optional OAuth keys via sync:false), repo-root
+  render.yaml (rootDir: app) so a Blueprint deploy works from the repo.
 """
 from __future__ import annotations
 
@@ -149,7 +157,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ClipCut", version="0.14.0-phase9", lifespan=lifespan)
+app = FastAPI(title="ClipCut", version="0.15.0-phase10", lifespan=lifespan)
 
 
 def init_db() -> None:
@@ -180,10 +188,110 @@ def init_db() -> None:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
+def index(request: Request) -> HTMLResponse:
+    # Phase 10: public landing page. The classic studio UI lives at
+    # /studio now — same template, same API routes, nothing removed.
+    path = ROOT / "templates" / "landing.html"
+    if not path.is_file():
+        raise HTTPException(status_code=500, detail="Landing page is missing")
+    html = path.read_text(encoding="utf-8")
+    if _current_user(request):
+        # Logged-in visitors go straight to the dashboard, not signup.
+        html = html.replace('href="/signup"', 'href="/app"')
+        html = html.replace("Create free account", "Open your dashboard")
+        html = html.replace("Get clips", "Open your dashboard")
+    return HTMLResponse(html)
+
+
+@app.get("/studio", response_class=HTMLResponse)
+def studio() -> HTMLResponse:
     if not TEMPLATE_PATH.is_file():
         raise HTTPException(status_code=500, detail="UI template is missing")
     return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+
+def _legal_page(title: str, body: str) -> HTMLResponse:
+    return HTMLResponse(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{title} — ClipCut</title><style>"
+        "body{background:#0d1230;color:#f4f4f5;font-family:sans-serif;"
+        "max-width:680px;margin:40px auto;padding:0 20px;line-height:1.6}"
+        "a{color:#f9a8d4}h1{text-transform:uppercase}</style></head><body>"
+        f"<h1>{title}</h1>{body}"
+        "<p><a href=\"/\">&larr; Back to ClipCut</a> &middot; "
+        "<a href=\"/terms\">Terms</a> &middot; <a href=\"/privacy\">Privacy</a> "
+        "&middot; <a href=\"/acceptable-use\">Acceptable Use</a></p>"
+        "</body></html>")
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page() -> HTMLResponse:
+    return _legal_page("Terms", """
+<p><b>ClipCut</b> is a free, open-source tool for turning long videos and
+live streams into captioned short clips. The name "ClipCut" is a working
+placeholder, not the final brand.</p>
+<ul>
+<li>You must be 13 or older. One person per account.</li>
+<li>The service is provided as-is, with no uptime or results guarantee.
+Free hosting sleeps after 15 minutes idle and its filesystem is
+ephemeral — uploads and data can be wiped on restart. Download the
+clips you want to keep.</li>
+<li>You are responsible for the videos you upload or link, and for
+respecting the rights of the people in them. Do not upload content
+you do not have the right to use.</li>
+<li>Posting to YouTube uses <i>your</i> Google OAuth client and
+<i>your</i> account — posts are your responsibility. Nothing is ever
+posted without you queueing it first.</li>
+<li>AI features use <i>your</i> API key (bring your own key). Key usage
+and any provider charges are yours.</li>
+<li>We may change or stop the service at any time.</li>
+</ul>""")
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page() -> HTMLResponse:
+    return _legal_page("Privacy", """
+<p>ClipCut collects as little as possible:</p>
+<ul>
+<li><b>Account:</b> your name, email and a scrypt-hashed password (or
+Google sign-in, when configured). No advertising or analytics cookies
+— only one essential, httpOnly sign-in cookie.</li>
+<li><b>Your videos, transcripts, clips and renders</b> live on the
+server you run this on. On the free Render tier that storage is
+ephemeral and can be wiped on restart.</li>
+<li><b>Your AI keys</b> are encrypted at rest (Fernet, keyed by the
+server secret) and are never shown in full — only "Saved, ends in …".
+They are never shared with anyone.</li>
+<li><b>Posting tokens</b> (YouTube OAuth) are encrypted the same way
+and used only to post clips you queued.</li>
+<li>Nothing you upload is sold, shared, or used to train models.
+Transcripts and clips are sent to your chosen AI provider only when
+you set a key and run clip-finding — that provider's own privacy
+policy then applies to that text.</li>
+<li>Delete your account (Settings → Security) to delete your user,
+sessions, creators and owned uploads.</li>
+</ul>""")
+
+
+@app.get("/acceptable-use", response_class=HTMLResponse)
+def acceptable_use_page() -> HTMLResponse:
+    return _legal_page("Acceptable Use", """
+<p>Do not use ClipCut to:</p>
+<ul>
+<li>Upload or clip content you do not have the right to use, or that
+identifies private people without their consent.</li>
+<li>Impersonate someone, mislead viewers about who made a clip, or
+pass off someone else's work as your own.</li>
+<li>Post spam, scams, hate, or anything illegal through the posting
+queue — queued posts are your responsibility.</li>
+<li>Abuse the service (excessive uploads, attempts to break quotas,
+auth, or other users' data) or use it to attack YouTube, Twitch,
+Kick, or any AI provider.</li>
+<li>Share your account or your API keys with others through the app.</li>
+</ul>
+<p>Breaking these rules can get your account deleted. If you see abuse,
+contact the person running the server.</p>""")
 
 
 @app.get("/health")
@@ -192,7 +300,7 @@ def health() -> JSONResponse:
     # --version + one --list-impersonate-targets at first call) —
     # cheap, and they prove on the LIVE instance whether node and
     # browser impersonation are actually available there.
-    return JSONResponse({"status": "ok", "phase": 9, "app": "clipcut-phase9",
+    return JSONResponse({"status": "ok", "phase": 10, "app": "clipcut-phase10",
                          "ffmpeg": ffmpeg_status(),
                          "youtube": youtube_runtime_diagnostics(),
                          "live": live_worker_status(),
@@ -1303,6 +1411,7 @@ def _app_layout(user: dict, active: str, body: str) -> HTMLResponse:
             "<div class=\"wrap\"><aside class=\"sidebar\">"
             "<h2>ClipCut</h2><small>Clip live streams &amp; long videos</small><nav>"
             + nav("/app", "Home", "Home")
+            + nav("/app?tour=1", "✦ Product tour", "Tour")
             + nav("/app/videos", "All videos", "All videos")
             + "<div style=\"margin-top:14px;color:#a5b4fc;font-size:12px;"
               "text-transform:uppercase;letter-spacing:.1em\">Creators</div>"
@@ -1527,6 +1636,65 @@ def google_callback(request: Request):
         return RedirectResponse("/login?error=google-failed", status_code=303)
 
 
+TOUR_COOKIE = "clipcut_tour"
+
+
+def _tour_steps(user: dict, data: dict, ai_has_key: bool) -> list[dict]:
+    """Phase 10 product tour: 7 steps, each with a LIVE done-state
+    (nothing is ticked unless the user really did it)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        upload_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM uploads WHERE user_id=?",
+            (user["id"],)).fetchall()]
+    try:
+        approved = any(has_approved_clip(uid) for uid in upload_ids)
+    except Exception:
+        approved = False
+    try:
+        rendered = any(list_rendered_for_upload(uid) for uid in upload_ids)
+    except Exception:
+        rendered = False
+    try:
+        _qc = queue_counts(DB_PATH, user["id"])
+        queued = (_qc["waiting"] + _qc["posted_total"]) > 0
+    except Exception:
+        queued = False
+    return [
+        {"done": len(list_creators(DB_PATH, user["id"])) > 0,
+         "text": "Add your first creator — each streamer gets their own workspace.",
+         "href": "/app", "link": "Add a creator ↓"},
+        {"done": data["videos_total"] > 0,
+         "text": "Paste a link or upload a file — link ki zaroorat nahi, file bhi chalegi.",
+         "href": "/app", "link": "Clip box ↑"},
+        {"done": data["clips_total"] > 0,
+         "text": "Find clips — dual judge (words ≥ 50 AND reaction ≥ 40) picks the moments.",
+         "href": "/app/videos", "link": "All videos"},
+        {"done": approved,
+         "text": "Approve 1 test clip — Render All tabhi unlock hota hai.",
+         "href": "/app/videos", "link": "Open a video"},
+        {"done": rendered,
+         "text": "Render a clip — 9:16, captions, yuv420p. Re-make purana version overwrite nahi karta.",
+         "href": "/app/videos", "link": "Clip editor"},
+        {"done": queued,
+         "text": "Queue a clip for posting — YouTube Shorts, scheduled time par.",
+         "href": "/app/post-queue", "link": "Post queue"},
+        {"done": ai_has_key,
+         "text": "Add your AI key in Settings / AI — bina key ke bhi clips bante hain (rule-based).",
+         "href": "/app/settings/ai", "link": "AI settings"},
+    ]
+
+
+@app.post("/app/tour/dismiss")
+def tour_dismiss(request: Request):
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    resp = RedirectResponse("/app", status_code=303)
+    resp.set_cookie(TOUR_COOKIE, "done", max_age=365 * 24 * 3600,
+                    httponly=True, samesite="lax")
+    return resp
+
+
 @app.get("/app", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     user = _require_user(request)
@@ -1680,9 +1848,27 @@ def dashboard(request: Request) -> HTMLResponse:
                      "screen record karo, har 60s ke chunk se clips live bante hain.</p>"
                      "<a class=\"btn\" href=\"/live/record\">Record live</a> "
                      "<a class=\"btn ghost\" href=\"/app/live\">All live sessions</a></div>")
+    # Phase 10: first-run product tour — live done-states; hidden once
+    # dismissed (cookie) unless ?tour=1 forces it back.
+    _show_tour = (request.query_params.get("tour") == "1"
+                  or request.cookies.get(TOUR_COOKIE) != "done")
+    if _show_tour:
+        _steps = _tour_steps(user, data, ai_has_key)
+        _done_n = sum(1 for s in _steps if s["done"])
+        _rows = "".join(
+            f"<p>{'✅' if s['done'] else '☐'} {s['text']} "
+            f"<a href=\"{s['href']}\">{s['link']}</a></p>" for s in _steps)
+        tour_card = (f"<div class=\"card\" id=\"tour\"><h3>✦ Product tour — "
+                     f"{_done_n}/7 done</h3><p class=\"muted\">Pehli baar yahan ho "
+                     f"to ek-ek karke karo — har step ka link usi jagah le jata hai.</p>"
+                     f"{_rows}<form method=\"post\" action=\"/app/tour/dismiss\">"
+                     f"<button class=\"btn ghost\" type=\"submit\">Dismiss tour</button></form></div>")
+    else:
+        tour_card = ""
     body = f"""
 <h1>Home</h1>
 {_banner}
+{tour_card}
 <p class="muted">Good afternoon. {len(creators)} creator{'s' if len(creators) != 1 else ''}.</p>
 <div class="card"><h3>What do you want to clip today?</h3>
 <p class="muted">Paste a link to a video — ya neeche se file upload karo. You get captioned shorts back.</p>
@@ -2630,7 +2816,62 @@ def notifications(request: Request) -> HTMLResponse:
     user = _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    body = """<h1>Notifications</h1><div class="card">
+    # Phase 10: real attention list — clips awaiting a decision, queue
+    # problems, live sessions. Nothing is invented; empty = "Nothing yet".
+    rows: list[str] = []
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            uploads = conn.execute(
+                "SELECT id, original_name FROM uploads WHERE user_id=?",
+                (user["id"],)).fetchall()
+        for uid, name in uploads:
+            try:
+                clips = load_clips(uid).get("clips", [])
+            except Exception:
+                clips = []
+            if not clips:
+                continue
+            approvals = get_clip_approvals(uid)
+            pending = [c for c in clips
+                       if approvals.get(c.get("clip_id"), {}).get("status")
+                       not in ("approved", "rejected")]
+            if pending:
+                rows.append(
+                    f"<p>🎬 <b>{len(pending)} clip(s) need a decision</b> — "
+                    f"{_html.escape(name or uid)}: approve a test clip to "
+                    f"unlock Render All. "
+                    f"<a href=\"/app/videos/{uid}\">Open video</a></p>")
+    except Exception:
+        pass
+    try:
+        for status, label in (("failed", "failed to post"),
+                              ("waiting_account", "waiting for a YouTube account"),
+                              ("not_set_up", "cannot post — platform not set up")):
+            items = list_queue(DB_PATH, user["id"], status=status)
+            for it in items:
+                rows.append(
+                    f"<p>📮 <b>{_html.escape(it.get('title') or it.get('clip_id', ''))}</b> "
+                    f"{label} ({PLATFORMS.get(it.get('platform'), {}).get('label', it.get('platform'))}). "
+                    f"<a href=\"/app/post-queue\">Open post queue</a></p>")
+    except Exception:
+        pass
+    try:
+        live = [s for s in list_live_sessions(DB_PATH, user["id"])
+                if s and s["status"] in ("live", "stopping")]
+        for s in live:
+            rows.append(
+                f"<p>🔴 <b>Live session running</b> — "
+                f"{_html.escape(s.get('title') or s['session_id'])}: "
+                f"{s.get('chunks_count', 0)} chunks, {s.get('clips_count', 0)} clips. "
+                f"<a href=\"/app/live/{s['session_id']}\">Open session</a></p>")
+    except Exception:
+        pass
+    if rows:
+        body = ("<h1>Notifications</h1><div class=\"card\">"
+                "<p class=\"muted\">Clips needing attention — newest first "
+                "nahi, bas jo abhi action mangta hai.</p>" + "".join(rows) + "</div>")
+    else:
+        body = """<h1>Notifications</h1><div class="card">
 <p class="muted">Nothing yet. Recordings, finished clips and posts that need
 a look show up here.</p></div>"""
     return _app_layout(user, "Notifications", body)
@@ -2758,9 +2999,12 @@ def connected_apps(request: Request) -> HTMLResponse:
             "<span class=\"muted\">Not set up on this server.</span></p>"
             "<p><b>TikTok</b> — Post to TikTok from here. "
             "<span class=\"muted\">Not set up on this server.</span></p>"
-            "<p class=\"muted\">CreativeCut me bhi dono \"Not set up on this server\" "
-            "likhe the — inke liye official API + approval chahiye, isliye "
-            "Phase 8 me sirf YouTube wired hai.</p></div>")
+            "<p class=\"muted\">Instagram — Post Reels from here. "
+            "<span class=\"muted\">Not set up on this server.</span></p>"
+            "<p><b>TikTok</b> — Post to TikTok from here. "
+            "<span class=\"muted\">Not set up on this server.</span></p>"
+            "<p class=\"muted\">Dono ke liye official API + approval "
+            "chahiye, isliye Phase 8 me sirf YouTube wired hai.</p></div>")
     return _app_layout(user, "Settings", body)
 
 
